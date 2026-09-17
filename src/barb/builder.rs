@@ -12,11 +12,6 @@ use super::ir::{Program, Range, Type, TypeId};
 use constant::{Shape, Value};
 
 impl Program {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// The symbol for `name`, the same symbol every time.
     ///
     /// A scan rather than a table beside it. This runs once per declaration

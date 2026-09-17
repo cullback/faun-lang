@@ -3,7 +3,7 @@ use super::*;
 /// `Nat`, `U8`, and `List_U8`, which between them reach every case the
 /// encoding has.
 pub(super) fn types() -> (Program, TypeId, TypeId, TypeId) {
-    let mut program = Program::new();
+    let mut program = Program::default();
     let nat = program.declare_type("Nat");
     program.define_type(nat, &[("Zero", &[]), ("Succ", &[nat])]);
     let byte = program.declare_type("U8");
@@ -218,7 +218,7 @@ fn the_builder_writes_the_lets_itself() {
 /// `2 + 2`, with `Nat` as the inductive type it is: addition recurses on its
 /// second argument and the literal is a known value.
 pub(super) fn two_and_two() -> (Program, TypeId, FnId) {
-    let mut program = Program::new();
+    let mut program = Program::default();
     let nat = program.declare_type("Nat");
     program.define_type(nat, &[("Zero", &[]), ("Succ", &[nat])]);
 
