@@ -70,6 +70,12 @@ impl Encoder {
         self.spilled
     }
 
+    /// Forget what was written to a frame, so that the next function's
+    /// answer is about that function alone.
+    pub(super) const fn forget_spilled(&mut self) {
+        self.spilled = false;
+    }
+
     /// Fill every displacement, and report the branches that turned out not
     /// to reach in the byte they were given.
     pub(super) fn finish(mut self) -> (Vec<u8>, Vec<usize>) {

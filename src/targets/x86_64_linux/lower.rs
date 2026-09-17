@@ -347,13 +347,15 @@ impl Lowering<'_> {
         if self.frame > 0 {
             self.asm.open_frame(self.frame);
         }
-        let opened = self.asm.spilled();
+        // The flag answers for this function alone; opening a frame does not
+        // set it, so only what the body writes counts.
+        self.asm.forget_spilled();
         let params = self.program.values(function.params);
         for (&param, reg) in params.iter().zip(ARG_REGS) {
             self.store(param, reg);
         }
         self.region(function.body);
-        self.spilled[id.index()] = self.asm.spilled() && !opened;
+        self.spilled[id.index()] = self.asm.spilled();
     }
 
     fn region(&mut self, region: RegionId) {
