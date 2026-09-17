@@ -21,9 +21,6 @@ enum Command {
     Run,
 }
 
-/// Combinators rather than bpaf's `derive`, which would drag in `syn` and
-/// seconds of build time. `construct!` is only a `macro_rules!`, and is used
-/// just where two parsers have to be combined.
 fn cli() -> OptionParser<Command> {
     let output = short('o')
         .long("output")

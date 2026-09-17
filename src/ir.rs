@@ -1,6 +1,21 @@
 //! The machine IR. Names no register, syscall, instruction set, or word
 //! width.
 //!
+//! It decides:
+//!
+//! - Representation: the form each value takes, and the width it needs
+//! - Ownership: where a value is retained and released, and when storage is
+//!   unique enough to be reused in place
+//! - Layout: what is data, what is global, and what an offset means
+//! - Function signatures: arity, and the class of each parameter and result
+//!
+//! It does not decide:
+//!
+//! - Which values live in registers and which in memory
+//! - Calling conventions, stacks, and frames
+//! - Instruction selection and encoding
+//! - The target's word size, and what its platform provides
+//!
 //! Instructions live in one flat array, and everything of variable length --
 //! operand lists, the regions a construct holds -- is a range into a pool
 //! beside it. Nothing about an instruction is boxed or owned, so replacing
