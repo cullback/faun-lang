@@ -214,6 +214,12 @@ impl Program {
         CtorId(self.type_(owner).ctors.start + tag)
     }
 
+    /// The types a range of the pool holds.
+    #[must_use]
+    pub fn types_of(&self, range: Range) -> &[TypeId] {
+        &self.types_pool[range.range()]
+    }
+
     #[must_use]
     pub fn fields(&self, ctor: CtorId) -> &[TypeId] {
         &self.types_pool[self.ctor(ctor).fields.range()]

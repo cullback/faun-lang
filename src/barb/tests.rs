@@ -207,3 +207,56 @@ fn the_builder_writes_the_lets_itself() {
         "no trailing atom"
     );
 }
+
+/// `2 + 2`, with `Nat` as the inductive type it is: addition recurses on its
+/// second argument and the literal is a known value.
+pub(super) fn two_and_two() -> (Program, TypeId, FnId) {
+    let mut program = Program::new();
+    let nat = program.declare_type("Nat");
+    program.define_type(nat, &[("Zero", &[]), ("Succ", &[nat])]);
+
+    let add = program.declare("add", &[nat, nat], nat);
+    program.define(add, |b, args| {
+        let (left, right) = (args[0], args[1]);
+        b.match_(right, nat, |b, ctor, fields| match fields {
+            [] => left,
+            [k] => {
+                let rest = b.call(add, &[left, *k]);
+                b.con(ctor, &[rest])
+            }
+            _ => unreachable!("Nat takes at most one field"),
+        })
+    });
+
+    let two = program.intern_number(nat, 2);
+    let main = program.declare("main", &[], nat);
+    program.define(main, |b, _| {
+        let value = b.known(nat, two);
+        b.call(add, &[value, value])
+    });
+    program.set_entry(main);
+    (program, nat, main)
+}
+
+#[test]
+fn two_and_two_reads_back_as_what_was_written() {
+    let (program, ..) = two_and_two();
+    assert_eq!(
+        program.render(),
+        "Nat = Zero | Succ(Nat)
+
+add(v0: Nat, v1: Nat) -> Nat =
+  match v1 {
+    Zero =>
+      v0
+    Succ(v2) =>
+      let v3 = add(v0, v2)
+      Succ(v3)
+  }
+
+main() -> Nat =
+  let v0 = 2
+  add(v0, v0)
+"
+    );
+}

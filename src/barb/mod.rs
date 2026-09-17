@@ -31,6 +31,7 @@
 mod builder;
 mod constant;
 mod ir;
+mod pretty;
 
 pub use builder::Builder;
 pub use constant::{Shape, Value, as_bytes, as_number, decode, shape};
