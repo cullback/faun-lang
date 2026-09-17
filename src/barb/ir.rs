@@ -116,8 +116,11 @@ pub struct Program {
     /// Known values, encoded. See [`super::constant`].
     pub(super) consts: Vec<Range>,
     pub(super) bytes: Vec<u8>,
-    /// Every name the program uses, each once.
-    pub(super) names: Vec<String>,
+    /// Every name the program uses, each once, end to end. A [`Symbol`] is
+    /// an index into `symbols`, which says where in here its characters are,
+    /// so naming something allocates nothing.
+    pub(super) names: Vec<u8>,
+    pub(super) symbols: Vec<Range>,
     pub(super) entry: Option<FnId>,
 }
 
@@ -129,7 +132,18 @@ impl Program {
     /// If the symbol came from another program.
     #[must_use]
     pub fn name(&self, symbol: Symbol) -> &str {
-        &self.names[symbol.index()]
+        let at = self.symbols[symbol.index()];
+        std::str::from_utf8(&self.names[at.range()]).expect("a name was written as text")
+    }
+
+    /// Every name the program uses, end to end. For tests and rendering.
+    ///
+    /// # Panics
+    ///
+    /// Never: names are written as text.
+    #[must_use]
+    pub fn names_text(&self) -> &str {
+        std::str::from_utf8(&self.names).expect("names were written as text")
     }
 
     /// How many locals a body binds, parameters included: the deepest chain

@@ -27,11 +27,14 @@ impl Program {
     ///
     /// If the program outgrew the names it may have.
     pub fn symbol(&mut self, name: &str) -> Symbol {
-        if let Some(at) = self.names.iter().position(|held| held == name) {
+        let held = |at: &Range| &self.names[at.range()] == name.as_bytes();
+        if let Some(at) = self.symbols.iter().position(held) {
             return Symbol::at(at);
         }
-        self.names.push(name.to_owned());
-        Symbol::at(self.names.len() - 1)
+        let at = self.names.len();
+        self.names.extend_from_slice(name.as_bytes());
+        self.symbols.push(Range::of(at, name.len()));
+        Symbol::at(self.symbols.len() - 1)
     }
 
     /// Reserve a type. Its constructors follow, so that a field may name the
@@ -92,9 +95,9 @@ impl Program {
     ///
     /// If `value` is not of type `id`.
     pub fn intern(&mut self, id: TypeId, value: &Value) -> ConstId {
-        let mut bytes = Vec::new();
-        constant::encode(self, id, value, &mut bytes);
-        self.hold(&bytes)
+        self.hold(|program, out| {
+            constant::encode(program, id, value, out);
+        })
     }
 
     /// A number, written straight into the pool. The chain of constructors
@@ -115,9 +118,7 @@ impl Program {
             "`{}` carries something per element",
             self.name(name)
         );
-        let mut bytes = Vec::new();
-        constant::write_number(value, &mut bytes);
-        self.hold(&bytes)
+        self.hold(|_, out| constant::write_number(value, out))
     }
 
     /// A run of bytes, likewise.
@@ -140,15 +141,18 @@ impl Program {
             "`{}` does not hold numbers",
             self.name(name)
         );
-        let mut bytes = Vec::new();
-        constant::write_bytes(value, &mut bytes);
-        self.hold(&bytes)
+        self.hold(|_, out| constant::write_bytes(value, out))
     }
 
-    fn hold(&mut self, bytes: &[u8]) -> ConstId {
-        let start = self.bytes.len();
-        self.bytes.extend_from_slice(bytes);
-        self.consts.push(Range::of(start, bytes.len()));
+    /// Write into the pool itself, so that nothing is encoded into a buffer
+    /// and then copied in.
+    fn hold(&mut self, write: impl FnOnce(&Self, &mut Vec<u8>)) -> ConstId {
+        let mut bytes = std::mem::take(&mut self.bytes);
+        let start = bytes.len();
+        write(self, &mut bytes);
+        let len = bytes.len() - start;
+        self.bytes = bytes;
+        self.consts.push(Range::of(start, len));
         ConstId::at(self.consts.len() - 1)
     }
 

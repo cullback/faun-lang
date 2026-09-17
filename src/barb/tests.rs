@@ -45,6 +45,15 @@ fn a_name_is_interned_once_and_reads_back() {
     // Interning is idempotent, so a name costs one entry however often it is
     // written, and asking for one already held answers what is already there.
     assert_eq!(program.symbol("Zero"), on_nat);
+
+    // Every name the program uses, once each and end to end: naming things
+    // costs no allocation beyond the pool growing.
+    let names = "NatZeroSuccU8List_U8NilCons";
+    assert_eq!(
+        program.names_text(),
+        names,
+        "each name once, in declaration order"
+    );
 }
 
 #[test]
