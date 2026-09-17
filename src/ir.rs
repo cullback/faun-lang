@@ -1,12 +1,19 @@
 //! The machine IR. Names no register, syscall, instruction set, or word
 //! width.
 //!
+//! Instructions live in one flat array, and everything of variable length --
+//! operand lists, the regions a construct holds -- is a range into a pool
+//! beside it. Nothing about an instruction is boxed or owned, so replacing
+//! one is a store and a pass over them is a linear scan.
+//!
 //! Control flow is nested and never flattened to blocks and jumps:
 //!
 //! - Structure lowers to jumps in about fifteen lines. The reverse needs a
 //!   Relooper, which emscripten and LLVM's wasm backend each carry.
 //! - Regions take parameters, so a loop stays the tail call it was written
 //!   as and no target reconstructs one.
+//! - A region's instructions are contiguous, so walking one stays sequential
+//!   where a graph of blocks would scatter.
 //!
 //! A constant is 64 bits of pattern, not a number:
 //!
@@ -16,11 +23,59 @@
 //!   belongs to operations. LLVM dropped signed and unsigned integer types;
 //!   wasm never had them.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DataId(pub usize);
+use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlatformId(pub usize);
+macro_rules! index {
+    ($($name:ident),* $(,)?) => {$(
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub u32);
+
+        impl $name {
+            /// # Panics
+            ///
+            /// If the program outgrew the four billion of these it may have.
+            #[must_use]
+            pub fn at(index: usize) -> Self {
+                Self(u32::try_from(index).expect("a program within 4G of these"))
+            }
+
+            #[must_use]
+            pub fn index(self) -> usize {
+                usize::try_from(self.0).expect("an index that fits a pointer")
+            }
+        }
+    )*};
+}
+
+index!(ValueId, DataId, FunctionId, PlatformId, RegionId, OpId);
+
+/// A run of values in the program's operand pool. Argument lists, region
+/// parameters and the values a terminator carries are all one of these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Operands {
+    start: u32,
+    len: u32,
+}
+
+impl Operands {
+    /// # Panics
+    ///
+    /// Never, on any machine whose pointers reach 32 bits.
+    #[must_use]
+    pub fn len(self) -> usize {
+        usize::try_from(self.len).expect("an index that fits a pointer")
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    fn range(self) -> Range<usize> {
+        let start = usize::try_from(self.start).expect("an index that fits a pointer");
+        start..start + self.len()
+    }
+}
 
 /// Which of a program's two regions a datum sits in.
 ///
@@ -40,12 +95,6 @@ pub struct Span {
     pub start: u32,
     pub len: u32,
 }
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FunctionId(pub usize);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ValueId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
@@ -76,6 +125,13 @@ pub enum Binary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Relation {
+    Equal,
+    /// Unsigned, like every comparison on a word.
+    Less,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Width {
     Byte,
     Word,
@@ -85,18 +141,11 @@ pub enum Width {
 /// machine with a word narrower than 64 bits keeps its own stride.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offset {
-    Bytes(i64),
-    Words(i64),
+    Bytes(i32),
+    Words(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Relation {
-    Equal,
-    /// Unsigned, like every comparison on a word.
-    Less,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     Constant {
         class: Class,
@@ -133,54 +182,62 @@ pub enum Op {
     },
     PlatformCall {
         platform: PlatformId,
-        args: Vec<ValueId>,
+        args: Operands,
     },
     Call {
         function: FunctionId,
-        args: Vec<ValueId>,
+        args: Operands,
     },
     If {
         condition: ValueId,
-        then_region: Region,
-        else_region: Region,
+        then_region: RegionId,
+        else_region: RegionId,
     },
     /// Runs `body` with `initial`, then with whatever each `Continue`
     /// carries, until a `Break` leaves.
     Loop {
-        initial: Vec<ValueId>,
-        body: Region,
+        initial: Operands,
+        body: RegionId,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Instruction {
-    pub results: Vec<ValueId>,
-    pub op: Op,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Region {
-    pub params: Vec<ValueId>,
-    pub instructions: Vec<Instruction>,
-    pub terminator: Terminator,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Terminator {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
     /// Leave the enclosing `if`, giving it its results.
-    Yield(Vec<ValueId>),
-    Continue(Vec<ValueId>),
-    Break(Vec<ValueId>),
-    Return(Vec<ValueId>),
+    Yield,
+    Continue,
+    Break,
+    Return,
     Unreachable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Terminator {
+    pub exit: Exit,
+    pub values: Operands,
+}
+
+impl Terminator {
+    pub const UNREACHABLE: Self = Self {
+        exit: Exit::Unreachable,
+        values: Operands { start: 0, len: 0 },
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub params: Operands,
+    /// The instructions, contiguous, so that walking one is a scan.
+    pub ops: Operands,
+    pub terminator: Terminator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
     pub name: String,
-    pub params: Vec<ValueId>,
+    pub params: Operands,
     pub returns: Vec<Class>,
-    pub body: Region,
+    pub body: RegionId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,16 +251,12 @@ pub struct Program {
     spans: Vec<Span>,
     functions: Vec<Function>,
     classes: Vec<Class>,
-}
-
-impl Default for Region {
-    fn default() -> Self {
-        Self {
-            params: Vec::new(),
-            instructions: Vec::new(),
-            terminator: Terminator::Unreachable,
-        }
-    }
+    ops: Vec<Op>,
+    /// What each instruction defines, beside it rather than in it: a pass
+    /// that does not care never reads this array.
+    results: Vec<Operands>,
+    operands: Vec<ValueId>,
+    regions: Vec<Region>,
 }
 
 impl Program {
@@ -219,8 +272,12 @@ impl Program {
             spans: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            ops: Vec::new(),
+            results: Vec::new(),
+            operands: Vec::new(),
+            regions: Vec::new(),
         };
-        let entry = program.declare(entry, Vec::new(), vec![Class::Word]);
+        let entry = program.declare(entry, &[], vec![Class::Word]);
         (program, entry)
     }
 
@@ -246,7 +303,7 @@ impl Program {
         let len = u32::try_from(bytes.len()).expect("a datum within 4 GiB");
         blob.extend_from_slice(bytes);
         spans.push(Span { origin, start, len });
-        DataId(spans.len() - 1)
+        DataId::at(spans.len() - 1)
     }
 
     pub fn platform(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> PlatformId {
@@ -255,20 +312,25 @@ impl Program {
             params,
             returns,
         });
-        PlatformId(self.platform.len() - 1)
+        PlatformId::at(self.platform.len() - 1)
     }
 
     /// Separate from defining, so a body may call a function declared after
     /// it, or itself.
-    pub fn declare(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> FunctionId {
-        let params = params.into_iter().map(|class| self.fresh(class)).collect();
+    pub fn declare(&mut self, name: &str, params: &[Class], returns: Vec<Class>) -> FunctionId {
+        let params = self.mint(params);
+        self.regions.push(Region {
+            params: Operands::default(),
+            ops: Operands::default(),
+            terminator: Terminator::UNREACHABLE,
+        });
         self.functions.push(Function {
             name: name.to_owned(),
             params,
             returns,
-            body: Region::default(),
+            body: RegionId::at(self.regions.len() - 1),
         });
-        FunctionId(self.functions.len() - 1)
+        FunctionId::at(self.functions.len() - 1)
     }
 
     pub fn define(
@@ -276,37 +338,72 @@ impl Program {
         function: FunctionId,
         build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
     ) {
-        let params = self.functions[function.0].params.clone();
-        let body = {
-            let mut builder = Builder {
-                program: self,
-                params: params.clone(),
-                instructions: Vec::new(),
-            };
-            let terminator = build(&mut builder, &params);
-            builder.finish(terminator)
+        let entry = self.functions[function.index()].params;
+        let body = self.functions[function.index()].body;
+        let params: Vec<_> = self.values(entry).to_vec();
+
+        let mut builder = Builder {
+            program: self,
+            params: entry,
+            ops: Vec::new(),
+            results: Vec::new(),
         };
-        self.functions[function.0].body = body;
+        let terminator = build(&mut builder, &params);
+        let region = builder.finish(terminator);
+        self.regions[body.index()] = region;
+    }
+
+    /// Mint one value per class, and give back the run they occupy.
+    fn mint(&mut self, classes: &[Class]) -> Operands {
+        let start = u32::try_from(self.operands.len()).expect("a program within 4G operands");
+        for &class in classes {
+            self.classes.push(class);
+            self.operands.push(ValueId::at(self.classes.len() - 1));
+        }
+        Operands {
+            start,
+            len: u32::try_from(classes.len()).expect("a sane arity"),
+        }
+    }
+
+    /// Keep a list of existing values, giving back the run it occupies.
+    fn hold(&mut self, values: &[ValueId]) -> Operands {
+        let start = u32::try_from(self.operands.len()).expect("a program within 4G operands");
+        self.operands.extend_from_slice(values);
+        Operands {
+            start,
+            len: u32::try_from(values.len()).expect("a sane arity"),
+        }
+    }
+
+    #[must_use]
+    pub fn values(&self, operands: Operands) -> &[ValueId] {
+        &self.operands[operands.range()]
+    }
+
+    #[must_use]
+    pub fn ops(&self, region: RegionId) -> &[Op] {
+        let ops = self.regions[region.index()].ops;
+        &self.ops[ops.range()]
+    }
+
+    /// The instructions of a region, each with what it defines.
+    pub fn walk(&self, region: RegionId) -> impl Iterator<Item = (&Op, &[ValueId])> {
+        let ops = self.regions[region.index()].ops;
+        self.ops[ops.range()]
+            .iter()
+            .zip(&self.results[ops.range()])
+            .map(|(op, results)| (op, &self.operands[results.range()]))
+    }
+
+    #[must_use]
+    pub fn region(&self, region: RegionId) -> Region {
+        self.regions[region.index()]
     }
 
     #[must_use]
     pub fn platforms(&self) -> &[Platform] {
         &self.platform
-    }
-
-    #[must_use]
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    #[must_use]
-    pub fn globals(&self) -> &[u8] {
-        &self.globals
-    }
-
-    #[must_use]
-    pub fn datum(&self, data: DataId) -> Span {
-        self.spans[data.0]
     }
 
     #[must_use]
@@ -321,18 +418,28 @@ impl Program {
     }
 
     #[must_use]
-    pub fn class(&self, value: ValueId) -> Class {
-        self.classes[value.0]
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
     #[must_use]
-    pub const fn values(&self) -> usize {
-        self.classes.len()
+    pub fn globals(&self) -> &[u8] {
+        &self.globals
     }
 
-    fn fresh(&mut self, class: Class) -> ValueId {
-        self.classes.push(class);
-        ValueId(self.classes.len() - 1)
+    #[must_use]
+    pub fn datum(&self, data: DataId) -> Span {
+        self.spans[data.index()]
+    }
+
+    #[must_use]
+    pub fn class(&self, value: ValueId) -> Class {
+        self.classes[value.index()]
+    }
+
+    #[must_use]
+    pub const fn values_count(&self) -> usize {
+        self.classes.len()
     }
 }
 
@@ -346,17 +453,23 @@ pub const fn wrap(class: Class, value: u64) -> u64 {
     }
 }
 
+/// Accumulates one region.
+///
+/// Its instructions are appended to the program only when the region is
+/// finished, which is what keeps a region's run of them contiguous while
+/// nested regions are being built inside it.
 #[derive(Debug)]
 pub struct Builder<'a> {
     program: &'a mut Program,
-    params: Vec<ValueId>,
-    instructions: Vec<Instruction>,
+    params: Operands,
+    ops: Vec<Op>,
+    results: Vec<Operands>,
 }
 
 impl Builder<'_> {
     pub fn constant(&mut self, class: Class, value: u64) -> ValueId {
         let value = wrap(class, value);
-        self.push(Op::Constant { class, value }, vec![class])[0]
+        self.push(Op::Constant { class, value }, &[class])[0]
     }
 
     /// The same word, written the way a negative number reads.
@@ -365,7 +478,7 @@ impl Builder<'_> {
     }
 
     pub fn address_of(&mut self, data: DataId) -> ValueId {
-        self.push(Op::AddressOf(data), vec![Class::Address])[0]
+        self.push(Op::AddressOf(data), &[Class::Address])[0]
     }
 
     pub fn data_len(&mut self, data: DataId) -> ValueId {
@@ -375,7 +488,7 @@ impl Builder<'_> {
 
     pub fn binary(&mut self, op: Binary, left: ValueId, right: ValueId) -> ValueId {
         let class = self.program.class(left);
-        self.push(Op::Binary { op, left, right }, vec![class])[0]
+        self.push(Op::Binary { op, left, right }, &[class])[0]
     }
 
     pub fn compare(&mut self, relation: Relation, left: ValueId, right: ValueId) -> ValueId {
@@ -384,7 +497,7 @@ impl Builder<'_> {
             left,
             right,
         };
-        self.push(op, vec![Class::Word])[0]
+        self.push(op, &[Class::Word])[0]
     }
 
     pub fn load(&mut self, width: Width, address: ValueId, offset: Offset) -> ValueId {
@@ -393,7 +506,7 @@ impl Builder<'_> {
             address,
             offset,
         };
-        self.push(op, vec![Class::Word])[0]
+        self.push(op, &[Class::Word])[0]
     }
 
     pub fn store(&mut self, width: Width, address: ValueId, offset: Offset, value: ValueId) {
@@ -403,32 +516,34 @@ impl Builder<'_> {
             offset,
             value,
         };
-        self.push(op, Vec::new());
+        self.push(op, &[]);
     }
 
     pub fn convert(&mut self, class: Class, value: ValueId) -> ValueId {
-        self.push(Op::Convert { class, value }, vec![class])[0]
+        self.push(Op::Convert { class, value }, &[class])[0]
     }
 
-    pub fn platform_call(&mut self, platform: PlatformId, args: Vec<ValueId>) -> Vec<ValueId> {
-        let returns = self.program.platform[platform.0].returns.clone();
-        self.push(Op::PlatformCall { platform, args }, returns)
+    pub fn platform_call(&mut self, platform: PlatformId, args: &[ValueId]) -> Vec<ValueId> {
+        let returns = self.program.platform[platform.index()].returns.clone();
+        let args = self.program.hold(args);
+        self.push(Op::PlatformCall { platform, args }, &returns)
     }
 
-    pub fn call(&mut self, function: FunctionId, args: Vec<ValueId>) -> Vec<ValueId> {
-        let returns = self.program.functions[function.0].returns.clone();
-        self.push(Op::Call { function, args }, returns)
+    pub fn call(&mut self, function: FunctionId, args: &[ValueId]) -> Vec<ValueId> {
+        let returns = self.program.functions[function.index()].returns.clone();
+        let args = self.program.hold(args);
+        self.push(Op::Call { function, args }, &returns)
     }
 
     pub fn if_(
         &mut self,
         condition: ValueId,
-        results: Vec<Class>,
+        results: &[Class],
         then: impl FnOnce(&mut Builder) -> Terminator,
         otherwise: impl FnOnce(&mut Builder) -> Terminator,
     ) -> Vec<ValueId> {
-        let then_region = self.region(Vec::new(), |builder, _| then(builder));
-        let else_region = self.region(Vec::new(), |builder, _| otherwise(builder));
+        let then_region = self.region(&[], |builder, _| then(builder));
+        let else_region = self.region(&[], |builder, _| otherwise(builder));
         let op = Op::If {
             condition,
             then_region,
@@ -437,52 +552,88 @@ impl Builder<'_> {
         self.push(op, results)
     }
 
-    /// `results` are the classes a `Break` leaves with.
+    /// The body runs with `initial`, then with whatever each `Continue`
+    /// carries. `results` are the classes a `Break` leaves with.
     pub fn loop_(
         &mut self,
-        initial: Vec<ValueId>,
-        results: Vec<Class>,
+        initial: &[ValueId],
+        results: &[Class],
         build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
     ) -> Vec<ValueId> {
-        let classes: Vec<_> = initial.iter().map(|&v| self.program.class(v)).collect();
-        let body = self.region(classes, build);
+        let classes: Vec<_> = initial
+            .iter()
+            .map(|&value| self.program.class(value))
+            .collect();
+        let body = self.region(&classes, build);
+        let initial = self.program.hold(initial);
         self.push(Op::Loop { initial, body }, results)
+    }
+
+    // The exits, which have to intern the values they carry.
+
+    pub fn ret(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Return, values)
+    }
+
+    pub fn yield_(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Yield, values)
+    }
+
+    pub fn continue_(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Continue, values)
+    }
+
+    pub fn break_(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Break, values)
+    }
+
+    fn exit(&mut self, exit: Exit, values: &[ValueId]) -> Terminator {
+        Terminator {
+            exit,
+            values: self.program.hold(values),
+        }
     }
 
     fn region(
         &mut self,
-        params: Vec<Class>,
+        params: &[Class],
         build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
-    ) -> Region {
-        let params: Vec<_> = params
-            .into_iter()
-            .map(|class| self.program.fresh(class))
-            .collect();
+    ) -> RegionId {
+        let entry = self.program.mint(params);
+        let params: Vec<_> = self.program.values(entry).to_vec();
+
         let mut builder = Builder {
             program: self.program,
-            params: params.clone(),
-            instructions: Vec::new(),
+            params: entry,
+            ops: Vec::new(),
+            results: Vec::new(),
         };
         let terminator = build(&mut builder, &params);
-        builder.finish(terminator)
+        let region = builder.finish(terminator);
+
+        self.program.regions.push(region);
+        RegionId::at(self.program.regions.len() - 1)
     }
 
-    fn push(&mut self, op: Op, classes: Vec<Class>) -> Vec<ValueId> {
-        let results: Vec<_> = classes
-            .into_iter()
-            .map(|class| self.program.fresh(class))
-            .collect();
-        self.instructions.push(Instruction {
-            results: results.clone(),
-            op,
-        });
-        results
+    fn push(&mut self, op: Op, classes: &[Class]) -> Vec<ValueId> {
+        let results = self.program.mint(classes);
+        let values = self.program.values(results).to_vec();
+        self.ops.push(op);
+        self.results.push(results);
+        values
     }
 
+    /// Append this region's instructions to the program, where they become
+    /// one contiguous run.
     fn finish(self, terminator: Terminator) -> Region {
+        let start = u32::try_from(self.program.ops.len()).expect("a program within 4G ops");
+        let len = u32::try_from(self.ops.len()).expect("a region within 4G ops");
+        self.program.ops.extend_from_slice(&self.ops);
+        self.program.results.extend_from_slice(&self.results);
+
         Region {
             params: self.params,
-            instructions: self.instructions,
+            ops: Operands { start, len },
             terminator,
         }
     }
@@ -496,23 +647,17 @@ impl Builder<'_> {
 ///
 /// Names the first disagreement found.
 pub fn validate(program: &Program) -> Result<(), String> {
-    for function in &program.functions {
-        check(program, function, &function.body, &function.returns)?;
+    for function in program.functions() {
+        check(program, &function.name, function.body, &function.returns)?;
     }
     Ok(())
 }
 
-fn check(
-    program: &Program,
-    function: &Function,
-    region: &Region,
-    returns: &[Class],
-) -> Result<(), String> {
-    let name = &function.name;
-    for instruction in &region.instructions {
-        match &instruction.op {
+fn check(program: &Program, name: &str, region: RegionId, returns: &[Class]) -> Result<(), String> {
+    for op in program.ops(region) {
+        match *op {
             Op::Binary { left, right, .. } | Op::Compare { left, right, .. } => {
-                let (left, right) = (program.class(*left), program.class(*right));
+                let (left, right) = (program.class(left), program.class(right));
                 if left != right {
                     return Err(format!("{name}: {left:?} and {right:?} in one operation"));
                 }
@@ -522,16 +667,21 @@ fn check(
                 else_region,
                 ..
             } => {
-                check(program, function, then_region, returns)?;
-                check(program, function, else_region, returns)?;
+                check(program, name, then_region, returns)?;
+                check(program, name, else_region, returns)?;
             }
-            Op::Loop { body, .. } => check(program, function, body, returns)?,
+            Op::Loop { body, .. } => check(program, name, body, returns)?,
             _ => {}
         }
     }
 
-    if let Terminator::Return(values) = &region.terminator {
-        let found: Vec<_> = values.iter().map(|&v| program.class(v)).collect();
+    let terminator = program.region(region).terminator;
+    if terminator.exit == Exit::Return {
+        let found: Vec<_> = program
+            .values(terminator.values)
+            .iter()
+            .map(|&value| program.class(value))
+            .collect();
         if found != returns {
             return Err(format!(
                 "{name} returns {returns:?} but leaves with {found:?}"
@@ -552,7 +702,7 @@ mod tests {
         let (mut program, main) = Program::new("main");
         program.define(main, |b, _| {
             let byte = b.constant(Class::Fixed { bits: 8 }, 250);
-            Terminator::Return(vec![byte])
+            b.ret(&[byte])
         });
 
         let error = validate(&program).unwrap_err();
@@ -561,7 +711,8 @@ mod tests {
         let (mut program, main) = Program::new("main");
         program.define(main, |b, _| {
             let byte = b.constant(Class::Fixed { bits: 8 }, 250);
-            Terminator::Return(vec![b.convert(Class::Word, byte)])
+            let word = b.convert(Class::Word, byte);
+            b.ret(&[word])
         });
         assert!(validate(&program).is_ok());
     }
@@ -573,10 +724,16 @@ mod tests {
             let byte = b.constant(Class::Fixed { bits: 8 }, 1);
             let word = b.constant(Class::Word, 1);
             let sum = b.binary(Binary::Add, byte, word);
-            Terminator::Return(vec![b.convert(Class::Word, sum)])
+            let sum = b.convert(Class::Word, sum);
+            b.ret(&[sum])
         });
 
         let error = validate(&program).unwrap_err();
         assert!(error.contains("in one operation"), "{error}");
+    }
+
+    #[test]
+    fn an_instruction_stays_small() {
+        assert!(size_of::<Op>() <= 24, "{} bytes", size_of::<Op>());
     }
 }

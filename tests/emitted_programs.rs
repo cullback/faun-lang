@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 
 use faun::ir::Class::Word;
-use faun::ir::{Binary, Class, Offset, Program, Relation, Terminator, Width};
+use faun::ir::{Binary, Class, Offset, Program, Relation, Width};
 use faun::targets::Target;
 
 #[test]
@@ -140,7 +140,7 @@ fn empty() -> Program {
     let (mut program, main) = Program::new("main");
     program.define(main, |b, _| {
         let status = b.constant(Word, 0);
-        Terminator::Return(vec![status])
+        b.ret(&[status])
     });
     program
 }
@@ -149,16 +149,17 @@ fn empty() -> Program {
 /// the answer is the exit status rather than anything printed.
 fn calls_a_function() -> Program {
     let (mut program, main) = Program::new("main");
-    let double = program.declare("double", vec![Word], vec![Word]);
+    let double = program.declare("double", &[Word], vec![Word]);
     program.define(double, |b, params| {
         let n = params[0];
-        Terminator::Return(vec![b.binary(Binary::Add, n, n)])
+        let doubled = b.binary(Binary::Add, n, n);
+        b.ret(&[doubled])
     });
 
     program.define(main, |b, _| {
         let twenty_one = b.constant(Word, 21);
-        let answer = b.call(double, vec![twenty_one]);
-        Terminator::Return(answer)
+        let answer = b.call(double, &[twenty_one]);
+        b.ret(&answer)
     });
     program
 }
@@ -167,31 +168,33 @@ fn calls_a_function() -> Program {
 /// frame that survives its own recursive call. 1 + 2 + 3 = 6.
 fn recurses() -> Program {
     let (mut program, main) = Program::new("main");
-    let sum = program.declare("sum", vec![Word], vec![Word]);
+    let sum = program.declare("sum", &[Word], vec![Word]);
     program.define(sum, |b, params| {
         let n = params[0];
         let zero = b.constant(Word, 0);
         let done = b.compare(Relation::Equal, n, zero);
         let answer = b.if_(
             done,
-            vec![Word],
+            &[Word],
             |b| {
                 let zero = b.constant(Word, 0);
-                Terminator::Yield(vec![zero])
+                b.yield_(&[zero])
             },
             |b| {
                 let one = b.constant(Word, 1);
                 let less = b.binary(Binary::Sub, n, one);
-                let rest = b.call(sum, vec![less]);
-                Terminator::Yield(vec![b.binary(Binary::Add, n, rest[0])])
+                let rest = b.call(sum, &[less]);
+                let total = b.binary(Binary::Add, n, rest[0]);
+                b.yield_(&[total])
             },
         );
-        Terminator::Return(answer)
+        b.ret(&answer)
     });
 
     program.define(main, |b, _| {
         let three = b.constant(Word, 3);
-        Terminator::Return(b.call(sum, vec![three]))
+        let answer = b.call(sum, &[three]);
+        b.ret(&answer)
     });
     program
 }
@@ -204,14 +207,15 @@ fn uses_the_heap() -> Program {
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
-        let page = b.platform_call(grow, vec![size])[0];
+        let page = b.platform_call(grow, &[size])[0];
 
         let answer = b.constant(Word, 42);
         let decoy = b.constant(Word, 7);
         b.store(Width::Word, page, Offset::Words(0), decoy);
         b.store(Width::Word, page, Offset::Words(1), answer);
 
-        Terminator::Return(vec![b.load(Width::Word, page, Offset::Words(1))])
+        let answer = b.load(Width::Word, page, Offset::Words(1));
+        b.ret(&[answer])
     });
     program
 }
@@ -225,7 +229,7 @@ fn stores_a_byte() -> Program {
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
-        let page = b.platform_call(grow, vec![size])[0];
+        let page = b.platform_call(grow, &[size])[0];
 
         let high = b.constant(Word, 200);
         b.store(Width::Byte, page, Offset::Bytes(0), high);
@@ -236,7 +240,8 @@ fn stores_a_byte() -> Program {
         let second = b.load(Width::Byte, page, Offset::Bytes(1));
         let expected = b.constant(Word, 200);
         let intact = b.compare(Relation::Equal, first, expected);
-        Terminator::Return(vec![b.binary(Binary::Add, intact, second)])
+        let answer = b.binary(Binary::Add, intact, second);
+        b.ret(&[answer])
     });
     program
 }
@@ -247,22 +252,23 @@ fn counts_in_a_global() -> Program {
     let (mut program, main) = Program::new("main");
     let counter = program.global(&[0; 8]);
 
-    let bump = program.declare("bump", Vec::new(), Vec::new());
+    let bump = program.declare("bump", &[], Vec::new());
     program.define(bump, |b, _| {
         let at = b.address_of(counter);
         let seen = b.load(Width::Word, at, Offset::Words(0));
         let one = b.constant(Word, 1);
         let next = b.binary(Binary::Add, seen, one);
         b.store(Width::Word, at, Offset::Words(0), next);
-        Terminator::Return(Vec::new())
+        b.ret(&[])
     });
 
     program.define(main, |b, _| {
-        b.call(bump, Vec::new());
-        b.call(bump, Vec::new());
-        b.call(bump, Vec::new());
+        b.call(bump, &[]);
+        b.call(bump, &[]);
+        b.call(bump, &[]);
         let at = b.address_of(counter);
-        Terminator::Return(vec![b.load(Width::Word, at, Offset::Words(0))])
+        let answer = b.load(Width::Word, at, Offset::Words(0));
+        b.ret(&[answer])
     });
     program
 }
@@ -278,7 +284,8 @@ fn wraps_at_eight_bits() -> Program {
         let right = b.constant(byte, 10);
         let sum = b.binary(Binary::Add, left, right);
         // The entry returns a word, and this is where the width changes.
-        Terminator::Return(vec![b.convert(Word, sum)])
+        let answer = b.convert(Word, sum);
+        b.ret(&[answer])
     });
     program
 }
@@ -290,7 +297,8 @@ fn less(left: u64, right: u64) -> Program {
     program.define(main, |b, _| {
         let left = b.constant(Word, left);
         let right = b.constant(Word, right);
-        Terminator::Return(vec![b.compare(Relation::Less, left, right)])
+        let answer = b.compare(Relation::Less, left, right);
+        b.ret(&[answer])
     });
     program
 }
@@ -304,28 +312,28 @@ fn countdown(times: u64) -> Program {
 
     program.define(main, |b, _| {
         let start = b.constant(Word, times);
-        b.loop_(vec![start], Vec::new(), |b, params| {
+        b.loop_(&[start], &[], |b, params| {
             let n = params[0];
             let zero = b.constant(Word, 0);
             let done = b.compare(Relation::Equal, n, zero);
             b.if_(
                 done,
-                Vec::new(),
-                |_| Terminator::Break(Vec::new()),
+                &[],
+                |b| b.break_(&[]),
                 |b| {
                     let buf = b.address_of(tick);
                     let len = b.constant(Word, 5);
-                    b.platform_call(write, vec![buf, len]);
+                    b.platform_call(write, &[buf, len]);
                     let one = b.constant(Word, 1);
                     let next = b.binary(Binary::Sub, n, one);
-                    Terminator::Continue(vec![next])
+                    b.continue_(&[next])
                 },
             );
-            Terminator::Unreachable
+            faun::ir::Terminator::UNREACHABLE
         });
 
         let status = b.constant(Word, 0);
-        Terminator::Return(vec![status])
+        b.ret(&[status])
     });
 
     program

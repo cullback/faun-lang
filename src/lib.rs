@@ -1,7 +1,7 @@
 pub mod ir;
 pub mod targets;
 
-use ir::{Class, Terminator};
+use ir::Class;
 use targets::{Artifact, Target};
 
 const MESSAGE: &[u8] = b"Hello, World!\n";
@@ -15,10 +15,10 @@ pub fn hello_world() -> ir::Program {
     program.define(main, |b, _| {
         let buf = b.address_of(message);
         let len = b.data_len(message);
-        b.platform_call(write, vec![buf, len]);
+        b.platform_call(write, &[buf, len]);
 
         let status = b.constant(Class::Word, 0);
-        Terminator::Return(vec![status])
+        b.ret(&[status])
     });
 
     program

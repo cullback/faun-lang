@@ -9,7 +9,7 @@
 
 use super::{Body, CALL, Code, DROP, END, I32_CONST, Segment};
 use crate::ir::{
-    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Origin, Program, Region, Relation,
+    Binary, Class, DataId, Exit, FunctionId, Offset, Op, Origin, Program, RegionId, Relation,
     Terminator, ValueId, Width,
 };
 use crate::targets::bytes::{Bytes, len32};
@@ -41,7 +41,7 @@ const I32_SHR_U: u8 = 0x76;
 const MEMORY_GROW: u8 = 0x40;
 
 /// A word on this target, in bytes, and a page as a power of two.
-const WORD: i64 = 4;
+const WORD: i32 = 4;
 /// A word here, in bits, which is what an unfixed class is held at.
 const WORD_BITS: u16 = 32;
 const PAGE_BITS: i32 = 16;
@@ -103,7 +103,7 @@ pub(super) fn lower(program: &Program) -> Code {
         // WASI refuses to run a module that imports anything and exports no
         // memory, even when nothing it imports reads one.
         memory: !state.imports.is_empty(),
-        entry: state.entry.0,
+        entry: state.entry.index(),
         imports: state.imports,
         bodies,
     }
@@ -121,38 +121,38 @@ impl Plan {
     /// wasm's numbering falls out: parameters first, then the rest.
     fn new(program: &Program) -> (Self, Vec<u32>) {
         let mut plan = Self {
-            source: vec![Source::Local(0); program.values()],
+            source: vec![Source::Local(0); program.values_count()],
             locals: 0,
             writes: 0,
         };
         let mut frames = Vec::new();
         for function in program.functions() {
             plan.locals = 0;
-            plan.walk(program, &function.body);
+            plan.walk(program, function.body);
             frames.push(plan.locals);
         }
         (plan, frames)
     }
 
-    fn walk(&mut self, program: &Program, region: &Region) {
-        for &param in &region.params {
+    fn walk(&mut self, program: &Program, region: RegionId) {
+        for &param in program.values(program.region(region).params) {
             self.give_local(param);
         }
-        for inst in &region.instructions {
-            match &inst.op {
+        for (op, results) in program.walk(region) {
+            match *op {
                 Op::Constant { value, .. } => {
-                    self.source[inst.results[0].0] = Source::Const(*value);
+                    self.source[results[0].index()] = Source::Const(value);
                 }
-                Op::AddressOf(data) => self.source[inst.results[0].0] = Source::Addr(*data),
+                Op::AddressOf(data) => self.source[results[0].index()] = Source::Addr(data),
                 _ => {
-                    for &result in &inst.results {
+                    for &result in results {
                         self.give_local(result);
                     }
                 }
             }
-            match &inst.op {
+            match *op {
                 Op::PlatformCall { platform, .. }
-                    if program.platforms()[platform.0].name == "write" =>
+                    if program.platforms()[platform.index()].name == "write" =>
                 {
                     self.writes += 1;
                 }
@@ -171,7 +171,7 @@ impl Plan {
     }
 
     fn give_local(&mut self, value: ValueId) {
-        self.source[value.0] = Source::Local(self.locals);
+        self.source[value.index()] = Source::Local(self.locals);
         self.locals += 1;
     }
 }
@@ -206,12 +206,15 @@ impl Lowering<'_> {
     /// Falling off the end of `_start` already means success, so an entry
     /// returning a constant zero costs nothing and needs no import.
     fn needs_proc_exit(&self) -> bool {
-        let entry = &self.program.functions()[self.entry.0];
-        !matches!(
-            entry.body.terminator,
-            Terminator::Return(ref values)
-                if values.first().is_none_or(|&v| self.constant(v) == Some(0))
-        )
+        let entry = &self.program.functions()[self.entry.index()];
+        let terminator = self.program.region(entry.body).terminator;
+        if terminator.exit != Exit::Return {
+            return true;
+        }
+        self.program
+            .values(terminator.values)
+            .first()
+            .is_some_and(|&value| self.constant(value) != Some(0))
     }
 
     /// `_start` returns nothing of its own, whatever the entry's signature
@@ -219,9 +222,9 @@ impl Lowering<'_> {
     fn bodies(&mut self, frames: &[u32]) -> Vec<Body> {
         let mut bodies = Vec::new();
         for (id, function) in self.program.functions().iter().enumerate() {
-            self.in_entry = id == self.entry.0;
+            self.in_entry = id == self.entry.index();
             self.body = Bytes::default();
-            self.region(&function.body);
+            self.region(function.body);
 
             let params = len32(function.params.len());
             bodies.push(Body {
@@ -265,26 +268,30 @@ impl Lowering<'_> {
         data
     }
 
-    fn region(&mut self, region: &Region) {
-        for inst in &region.instructions {
-            self.instruction(inst);
+    fn region(&mut self, region: RegionId) {
+        // The program outlives this, so the walk borrows it rather than
+        // `self`, and the loop stays one pass over a contiguous run.
+        let program = self.program;
+        for (op, results) in program.walk(region) {
+            self.instruction(op, results);
         }
-        self.terminator(&region.terminator);
+        self.terminator(program.region(region).terminator);
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "one call per op; the length is the patterns"
     )]
-    fn instruction(&mut self, inst: &Instruction) {
-        match &inst.op {
+    fn instruction(&mut self, op: &Op, results: &[ValueId]) {
+        let program = self.program;
+        match op {
             Op::Constant { .. } | Op::AddressOf(_) => {}
             Op::Binary { op, left, right } => {
                 let opcode = match op {
                     Binary::Add => I32_ADD,
                     Binary::Sub => I32_SUB,
                 };
-                self.binary(opcode, *left, *right, inst.results[0]);
+                self.binary(opcode, *left, *right, results[0]);
             }
             Op::Compare {
                 relation,
@@ -295,13 +302,13 @@ impl Lowering<'_> {
                     Relation::Equal => I32_EQ,
                     Relation::Less => I32_LT_U,
                 };
-                self.binary(opcode, *left, *right, inst.results[0]);
+                self.binary(opcode, *left, *right, results[0]);
             }
             Op::Load {
                 width,
                 address,
                 offset,
-            } => self.load_at(*width, *address, *offset, inst.results[0]),
+            } => self.load_at(*width, *address, *offset, results[0]),
             Op::Store {
                 width,
                 address,
@@ -312,18 +319,18 @@ impl Lowering<'_> {
                 self.push(*value);
                 let kept = bits(*class).min(bits(self.program.class(*value)));
                 self.narrow(kept);
-                self.set(inst.results[0]);
+                self.set(results[0]);
             }
             Op::PlatformCall { platform, args } => {
-                self.platform_call(*platform, args, &inst.results);
+                self.platform_call(*platform, program.values(*args), results);
             }
             Op::Call { function, args } => {
-                for &arg in args {
+                for &arg in program.values(*args) {
                     self.push(arg);
                 }
                 let imports = len32(self.imports.len());
-                self.call(imports + len32(function.0));
-                for &result in inst.results.iter().rev() {
+                self.call(imports + len32(function.index()));
+                for &result in results.iter().rev() {
                     self.set(result);
                 }
             }
@@ -331,8 +338,10 @@ impl Lowering<'_> {
                 condition,
                 then_region,
                 else_region,
-            } => self.conditional(*condition, then_region, else_region, &inst.results),
-            Op::Loop { initial, body } => self.repeat(initial, body, &inst.results),
+            } => self.conditional(*condition, *then_region, *else_region, results),
+            Op::Loop { initial, body } => {
+                self.repeat(program.values(*initial), *body, results);
+            }
         }
     }
 
@@ -368,8 +377,8 @@ impl Lowering<'_> {
     fn conditional(
         &mut self,
         condition: ValueId,
-        then_region: &Region,
-        else_region: &Region,
+        then_region: RegionId,
+        else_region: RegionId,
         results: &[ValueId],
     ) {
         self.push(condition);
@@ -386,8 +395,10 @@ impl Lowering<'_> {
         self.close();
     }
 
-    fn repeat(&mut self, initial: &[ValueId], body: &Region, results: &[ValueId]) {
-        self.transfer(initial, &body.params);
+    fn repeat(&mut self, initial: &[ValueId], body: RegionId, results: &[ValueId]) {
+        let program = self.program;
+        let params = program.values(program.region(body).params);
+        self.transfer(initial, params);
         self.body.byte(BLOCK);
         self.body.byte(EMPTY);
         self.open();
@@ -398,7 +409,7 @@ impl Lowering<'_> {
         let again = self.depth - 1;
 
         self.loops.push(LoopFrame {
-            params: body.params.clone(),
+            params: params.to_vec(),
             again,
             results: results.to_vec(),
             exit,
@@ -410,27 +421,31 @@ impl Lowering<'_> {
         self.close();
     }
 
-    fn terminator(&mut self, terminator: &Terminator) {
-        match terminator {
+    fn terminator(&mut self, terminator: Terminator) {
+        let program = self.program;
+        let values = program.values(terminator.values);
+        match terminator.exit {
             // The `end` that closes the if is the branch.
-            Terminator::Yield(values) => {
+            Exit::Yield => {
                 let results = self.ifs.last().expect("a yield inside an if").clone();
                 self.transfer(values, &results);
             }
-            Terminator::Continue(values) => {
+            Exit::Continue => {
                 let frame = self.loops.last().expect("a continue inside a loop");
                 let (params, again) = (frame.params.clone(), frame.again);
                 self.transfer(values, &params);
                 self.branch(again);
             }
-            Terminator::Break(values) => {
+            Exit::Break => {
                 let frame = self.loops.last().expect("a break inside a loop");
                 let (results, exit) = (frame.results.clone(), frame.exit);
                 self.transfer(values, &results);
                 self.branch(exit);
             }
-            Terminator::Return(values) => {
+            Exit::Return => {
                 if self.in_entry {
+                    // The status the entry returns is the program's, and a
+                    // WASI command has no result of its own.
                     if let Some(index) = self.import("proc_exit") {
                         for &value in values {
                             self.push(value);
@@ -444,7 +459,7 @@ impl Lowering<'_> {
                     self.body.byte(RETURN);
                 }
             }
-            Terminator::Unreachable => {
+            Exit::Unreachable => {
                 if self.depth > 0 {
                     self.body.byte(UNREACHABLE);
                 }
@@ -475,7 +490,7 @@ impl Lowering<'_> {
         args: &[ValueId],
         results: &[ValueId],
     ) {
-        match self.program.platforms()[platform.0].name.as_str() {
+        match self.program.platforms()[platform.index()].name.as_str() {
             "write" => {
                 let index = self.written;
                 self.written += 1;
@@ -535,7 +550,7 @@ impl Lowering<'_> {
     }
 
     fn push(&mut self, value: ValueId) {
-        match self.plan.source[value.0] {
+        match self.plan.source[value.index()] {
             Source::Const(value) => {
                 let narrow = u32::try_from(value).expect("a word this target can hold");
                 self.constant_i32(narrow.cast_signed());
@@ -552,7 +567,7 @@ impl Lowering<'_> {
     }
 
     fn set(&mut self, value: ValueId) {
-        let Source::Local(index) = self.plan.source[value.0] else {
+        let Source::Local(index) = self.plan.source[value.index()] else {
             panic!("a computed value needs a local");
         };
         self.body.byte(LOCAL_SET);
@@ -568,7 +583,7 @@ impl Lowering<'_> {
     }
 
     fn constant(&self, value: ValueId) -> Option<u32> {
-        match self.plan.source[value.0] {
+        match self.plan.source[value.index()] {
             Source::Const(value) => {
                 Some(u32::try_from(value).expect("a word this target can hold"))
             }
@@ -662,7 +677,7 @@ mod tests {
     fn a_nonzero_status_has_to_be_called_in() {
         let program = entry(|b| {
             let status = b.constant(Class::Word, 3);
-            Terminator::Return(vec![status])
+            b.ret(&[status])
         });
         let code = lower(&program);
         assert_eq!(code.imports, ["proc_exit"]);
@@ -676,22 +691,22 @@ mod tests {
     fn a_loop_is_a_loop() {
         let program = entry(|b| {
             let start = b.constant(Class::Word, 1);
-            b.loop_(vec![start], Vec::new(), |b, params| {
+            b.loop_(&[start], &[], |b, params| {
                 let zero = b.constant(Class::Word, 0);
                 let done = b.compare(Relation::Equal, params[0], zero);
                 b.if_(
                     done,
-                    Vec::new(),
-                    |_| Terminator::Break(Vec::new()),
+                    &[],
+                    |b| b.break_(&[]),
                     |b| {
                         let one = b.constant(Class::Word, 1);
                         let next = b.binary(Binary::Sub, params[0], one);
-                        Terminator::Continue(vec![next])
+                        b.continue_(&[next])
                     },
                 );
-                Terminator::Unreachable
+                Terminator::UNREACHABLE
             });
-            Terminator::Unreachable
+            Terminator::UNREACHABLE
         });
 
         let body = lower(&program).bodies[0].code.clone();

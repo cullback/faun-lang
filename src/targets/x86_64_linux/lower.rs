@@ -9,8 +9,8 @@
 use super::encode::{Encoder, Reg};
 use super::{Code, Reloc};
 use crate::ir::{
-    Binary, Class, DataId, Function, FunctionId, Instruction, Offset, Op, PlatformId, Program,
-    Region, Relation, Terminator, ValueId, Width,
+    Binary, Class, DataId, Exit, Function, FunctionId, Offset, Op, PlatformId, Program, RegionId,
+    Relation, Terminator, ValueId, Width,
 };
 
 const SYS_WRITE: u64 = 1;
@@ -23,7 +23,7 @@ const PROT_READ_WRITE: u64 = 0x3;
 const MAP_PRIVATE_ANONYMOUS: u64 = 0x22;
 
 /// A word in bytes, which is what [`Offset::Words`] counts.
-const WORD: i64 = 8;
+const WORD: i32 = 8;
 
 /// A word here, in bits, which is what an unfixed class is held at.
 const WORD_BITS: u16 = 64;
@@ -113,13 +113,13 @@ fn assemble(
 
     // The entry goes first, so the image starts where the kernel jumps.
     let rest = (0..program.functions().len())
-        .map(FunctionId)
-        .filter(|id| id.0 != entry.0);
+        .map(FunctionId::at)
+        .filter(|id| id.index() != entry.index());
     for id in std::iter::once(entry).chain(rest) {
         state.function(id);
     }
     for (hole, id) in std::mem::take(&mut state.calls) {
-        let target = state.starts[id.0];
+        let target = state.starts[id.index()];
         state.asm.patch(hole, target);
     }
 
@@ -140,8 +140,8 @@ struct Plan {
 impl Plan {
     fn empty(program: &Program) -> Self {
         Self {
-            source: vec![Source::Slot(0); program.values()],
-            uses: vec![0; program.values()],
+            source: vec![Source::Slot(0); program.values_count()],
+            uses: vec![0; program.values_count()],
             scratch: 0,
             frame: 0,
         }
@@ -153,43 +153,47 @@ impl Plan {
     fn new(program: &Program, function: &Function) -> Self {
         let mut plan = Self::empty(program);
         let mut widest = function.params.len();
-        plan.count(&function.body);
-        plan.walk(program, &function.body, &mut widest);
+        plan.count(program, function.body);
+        plan.walk(program, function.body, &mut widest);
         plan.scratch = plan.frame;
         plan.frame += 8 * u32::try_from(widest).expect("a sane region width");
         plan
     }
 
-    fn walk(&mut self, program: &Program, region: &Region, widest: &mut usize) {
-        for &param in &region.params {
+    fn walk(&mut self, program: &Program, region: RegionId, widest: &mut usize) {
+        let params = program.region(region).params;
+        for &param in program.values(params) {
             self.give_slot(param);
         }
-        *widest = (*widest).max(region.params.len());
+        *widest = (*widest).max(params.len());
 
-        for inst in &region.instructions {
-            match &inst.op {
+        for (op, results) in program.walk(region) {
+            match *op {
                 Op::Constant { value, .. } => {
-                    self.source[inst.results[0].0] = Source::Const(*value);
+                    self.source[results[0].index()] = Source::Const(value);
                 }
-                Op::AddressOf(data) => self.source[inst.results[0].0] = Source::Addr(*data),
+                Op::AddressOf(data) => self.source[results[0].index()] = Source::Addr(data),
                 // A conversion that narrows nothing leaves the bits alone,
                 // so the result can live wherever the operand does.
                 Op::Convert { class, value }
-                    if !Encoder::narrows(bits(*class).min(bits(program.class(*value)))) =>
+                    if !Encoder::narrows(bits(class).min(bits(program.class(value)))) =>
                 {
-                    let result = inst.results[0];
-                    self.source[result.0] = self.source[value.0];
+                    let result = results[0];
+                    self.source[result.index()] = self.source[value.index()];
                     // The storage is shared, so its readers are too, and
                     // this conversion is no longer one of them.
-                    self.uses[value.0] += self.uses[result.0] - 1;
+                    self.uses[value.index()] += self.uses[result.index()] - 1;
                 }
                 _ => {
-                    for &result in &inst.results {
+                    for &result in results {
                         self.give_slot(result);
                     }
                 }
             }
-            match &inst.op {
+        }
+
+        for op in program.ops(region) {
+            match *op {
                 Op::If {
                     then_region,
                     else_region,
@@ -202,54 +206,55 @@ impl Plan {
                 _ => {}
             }
         }
-        *widest = (*widest).max(transferred(&region.terminator).len());
+        *widest = (*widest).max(transferred(program, region).len());
     }
 
     /// Every read of every value, so that a result nothing reads is never
     /// written and one read once may stay in a register.
-    fn count(&mut self, region: &Region) {
-        let mut read = |values: &[ValueId]| {
+    fn count(&mut self, program: &Program, region: RegionId) {
+        let read = |uses: &mut Vec<u32>, values: &[ValueId]| {
             for &value in values {
-                self.uses[value.0] += 1;
+                uses[value.index()] += 1;
             }
         };
-        for inst in &region.instructions {
-            match &inst.op {
+        for op in program.ops(region) {
+            match *op {
                 Op::Constant { .. } | Op::AddressOf(_) => {}
                 Op::Binary { left, right, .. } | Op::Compare { left, right, .. } => {
-                    read(&[*left, *right]);
+                    read(&mut self.uses, &[left, right]);
                 }
-                Op::Load { address, .. } => read(&[*address]),
-                Op::Store { address, value, .. } => read(&[*address, *value]),
-                Op::Convert { value, .. } => read(&[*value]),
-                Op::PlatformCall { args, .. } | Op::Call { args, .. } => read(args),
-                Op::If { condition, .. } => read(&[*condition]),
-                Op::Loop { initial, .. } => read(initial),
+                Op::Load { address, .. } => read(&mut self.uses, &[address]),
+                Op::Store { address, value, .. } => read(&mut self.uses, &[address, value]),
+                Op::Convert { value, .. } => read(&mut self.uses, &[value]),
+                Op::PlatformCall { args, .. } | Op::Call { args, .. } => {
+                    read(&mut self.uses, program.values(args));
+                }
+                Op::If { condition, .. } => read(&mut self.uses, &[condition]),
+                Op::Loop { initial, .. } => read(&mut self.uses, program.values(initial)),
             }
         }
-        read(transferred(&region.terminator));
-        if let Terminator::Return(values) = &region.terminator {
-            read(values);
-        }
 
-        for inst in &region.instructions {
-            match &inst.op {
+        let terminator = program.region(region).terminator;
+        read(&mut self.uses, program.values(terminator.values));
+
+        for op in program.ops(region) {
+            match *op {
                 Op::If {
                     then_region,
                     else_region,
                     ..
                 } => {
-                    self.count(then_region);
-                    self.count(else_region);
+                    self.count(program, then_region);
+                    self.count(program, else_region);
                 }
-                Op::Loop { body, .. } => self.count(body),
+                Op::Loop { body, .. } => self.count(program, body),
                 _ => {}
             }
         }
     }
 
     fn give_slot(&mut self, value: ValueId) {
-        self.source[value.0] = Source::Slot(self.frame);
+        self.source[value.index()] = Source::Slot(self.frame);
         self.frame += 8;
     }
 }
@@ -263,23 +268,21 @@ const fn bits(class: Class) -> u16 {
 }
 
 /// A byte distance, which is what the machine addresses in.
-fn displacement(offset: Offset) -> i32 {
-    let bytes = match offset {
+const fn displacement(offset: Offset) -> i32 {
+    match offset {
         Offset::Bytes(bytes) => bytes,
         Offset::Words(words) => words * WORD,
-    };
-    i32::try_from(bytes).expect("an offset within 2 GiB")
+    }
 }
 
 /// The values a terminator moves through scratch. `Return` is not among
 /// them: it reads straight into the register it leaves by, so counting it
 /// would buy a frame that nothing writes to.
-fn transferred(terminator: &Terminator) -> &[ValueId] {
-    match terminator {
-        Terminator::Yield(values) | Terminator::Continue(values) | Terminator::Break(values) => {
-            values
-        }
-        Terminator::Return(_) | Terminator::Unreachable => &[],
+fn transferred(program: &Program, region: RegionId) -> &[ValueId] {
+    let terminator = program.region(region).terminator;
+    match terminator.exit {
+        Exit::Yield | Exit::Continue | Exit::Break => program.values(terminator.values),
+        Exit::Return | Exit::Unreachable => &[],
     }
 }
 
@@ -330,13 +333,13 @@ impl Lowering<'_> {
     }
 
     fn function(&mut self, id: FunctionId) {
-        let function = &self.program.functions()[id.0];
-        self.in_entry = id.0 == self.entry.0;
-        self.starts[id.0] = self.asm.here();
+        let function = &self.program.functions()[id.index()];
+        self.in_entry = id.index() == self.entry.index();
+        self.starts[id.index()] = self.asm.here();
         self.plan = Plan::new(self.program, function);
         self.forget();
 
-        self.frame = if self.framed[id.0] {
+        self.frame = if self.framed[id.index()] {
             self.plan.frame
         } else {
             0
@@ -345,41 +348,46 @@ impl Lowering<'_> {
             self.asm.open_frame(self.frame);
         }
         let opened = self.asm.spilled();
-        for (&param, reg) in function.params.iter().zip(ARG_REGS) {
+        let params = self.program.values(function.params);
+        for (&param, reg) in params.iter().zip(ARG_REGS) {
             self.store(param, reg);
         }
-        self.region(&function.body);
-        self.spilled[id.0] = self.asm.spilled() && !opened;
+        self.region(function.body);
+        self.spilled[id.index()] = self.asm.spilled() && !opened;
     }
 
-    fn region(&mut self, region: &Region) {
-        for inst in &region.instructions {
-            self.instruction(inst);
+    fn region(&mut self, region: RegionId) {
+        // The program outlives this, so the walk borrows it rather than
+        // `self`, and the loop stays one pass over a contiguous run.
+        let program = self.program;
+        for (op, results) in program.walk(region) {
+            self.instruction(op, results);
         }
-        self.terminator(&region.terminator);
+        self.terminator(program.region(region).terminator);
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "one call per op; the length is the patterns"
     )]
-    fn instruction(&mut self, inst: &Instruction) {
-        match &inst.op {
+    fn instruction(&mut self, op: &Op, results: &[ValueId]) {
+        let program = self.program;
+        match op {
             // Materialised where they are read, never where they are written.
             Op::Constant { .. } | Op::AddressOf(_) => {}
             Op::Binary { op, left, right } => {
-                self.binary(*op, *left, *right, inst.results[0]);
+                self.binary(*op, *left, *right, results[0]);
             }
             Op::Compare {
                 relation,
                 left,
                 right,
-            } => self.compare(*relation, *left, *right, inst.results[0]),
+            } => self.compare(*relation, *left, *right, results[0]),
             Op::Load {
                 width,
                 address,
                 offset,
-            } => self.load_at(*width, *address, *offset, inst.results[0]),
+            } => self.load_at(*width, *address, *offset, results[0]),
             Op::Store {
                 width,
                 address,
@@ -394,14 +402,14 @@ impl Lowering<'_> {
                 if Encoder::narrows(kept) {
                     self.read(Reg::Rax, *value);
                     self.asm.narrow(kept);
-                    self.keep(inst.results[0]);
+                    self.keep(results[0]);
                 }
             }
             Op::PlatformCall { platform, args } => {
-                self.platform_call(*platform, args, &inst.results);
+                self.platform_call(*platform, program.values(*args), results);
             }
             Op::Call { function, args } => {
-                for (&arg, reg) in args.iter().zip(ARG_REGS) {
+                for (&arg, reg) in program.values(*args).iter().zip(ARG_REGS) {
                     self.read(reg, arg);
                 }
                 self.flush();
@@ -409,7 +417,7 @@ impl Lowering<'_> {
                 self.calls.push((hole, *function));
                 // Every register this tracks is caller-saved.
                 self.forget();
-                if let Some(&result) = inst.results.first() {
+                if let Some(&result) = results.first() {
                     self.keep(result);
                 }
             }
@@ -417,8 +425,10 @@ impl Lowering<'_> {
                 condition,
                 then_region,
                 else_region,
-            } => self.conditional(*condition, then_region, else_region, &inst.results),
-            Op::Loop { initial, body } => self.repeat(initial, body, &inst.results),
+            } => self.conditional(*condition, *then_region, *else_region, results),
+            Op::Loop { initial, body } => {
+                self.repeat(program.values(*initial), *body, results);
+            }
         }
     }
 
@@ -473,7 +483,7 @@ impl Lowering<'_> {
     }
 
     fn platform_call(&mut self, platform: PlatformId, args: &[ValueId], results: &[ValueId]) {
-        match self.program.platforms()[platform.0].name.as_str() {
+        match self.program.platforms()[platform.index()].name.as_str() {
             "write" => {
                 // rax first, so stdout can be copied from it.
                 self.load_const(Reg::Rax, SYS_WRITE);
@@ -506,8 +516,8 @@ impl Lowering<'_> {
     fn conditional(
         &mut self,
         condition: ValueId,
-        then_region: &Region,
-        else_region: &Region,
+        then_region: RegionId,
+        else_region: RegionId,
         results: &[ValueId],
     ) {
         self.read(Reg::Rax, condition);
@@ -528,12 +538,14 @@ impl Lowering<'_> {
         self.land(frame.ends);
     }
 
-    fn repeat(&mut self, initial: &[ValueId], body: &Region, results: &[ValueId]) {
-        self.transfer(initial, &body.params);
+    fn repeat(&mut self, initial: &[ValueId], body: RegionId, results: &[ValueId]) {
+        let program = self.program;
+        let params = program.values(program.region(body).params);
+        self.transfer(initial, params);
         self.forget();
 
         self.loops.push(LoopFrame {
-            params: body.params.clone(),
+            params: params.to_vec(),
             head: self.asm.here(),
             results: results.to_vec(),
             ends: Vec::new(),
@@ -553,32 +565,34 @@ impl Lowering<'_> {
         self.forget();
     }
 
-    fn terminator(&mut self, terminator: &Terminator) {
-        match terminator {
-            Terminator::Yield(values) => {
+    fn terminator(&mut self, terminator: Terminator) {
+        let program = self.program;
+        let values = program.values(terminator.values);
+        match terminator.exit {
+            Exit::Yield => {
                 let frame = self.ifs.last().expect("a yield inside an if");
                 let results = frame.results.clone();
                 self.transfer(values, &results);
                 let hole = self.asm.jump();
                 self.ifs.last_mut().expect("an if").ends.push(hole);
             }
-            Terminator::Continue(values) => {
+            Exit::Continue => {
                 let frame = self.loops.last().expect("a continue inside a loop");
                 let (params, head) = (frame.params.clone(), frame.head);
                 self.transfer(values, &params);
                 let hole = self.asm.jump();
                 self.asm.patch(hole, head);
             }
-            Terminator::Break(values) => {
+            Exit::Break => {
                 let frame = self.loops.last().expect("a break inside a loop");
                 let results = frame.results.clone();
                 self.transfer(values, &results);
                 let hole = self.asm.jump();
                 self.loops.last_mut().expect("a loop").ends.push(hole);
             }
-            Terminator::Return(values) => self.leave(values),
+            Exit::Return => self.leave(values),
             // Emitting nothing would fall into whatever was laid out next.
-            Terminator::Unreachable => self.asm.trap(),
+            Exit::Unreachable => self.asm.trap(),
         }
     }
 
@@ -637,11 +651,11 @@ impl Lowering<'_> {
     /// read exactly once and that reader may find it still in the register.
     fn keep(&mut self, value: ValueId) {
         debug_assert!(self.pending.is_none(), "a result left unwritten");
-        if self.plan.uses[value.0] == 0 {
+        if self.plan.uses[value.index()] == 0 {
             self.holds[Reg::Rax.index()] = Some(value);
             return;
         }
-        if self.plan.uses[value.0] == 1 {
+        if self.plan.uses[value.index()] == 1 {
             self.known[Reg::Rax.index()] = None;
             self.holds[Reg::Rax.index()] = Some(value);
             self.pending = Some(value);
@@ -653,7 +667,7 @@ impl Lowering<'_> {
     /// Whether a register's occupant and `value` are the same as far as
     /// storage goes, which an aliased conversion makes possible.
     fn shares(&self, held: Option<ValueId>, value: ValueId) -> bool {
-        held.is_some_and(|held| self.plan.source[held.0] == self.plan.source[value.0])
+        held.is_some_and(|held| self.plan.source[held.index()] == self.plan.source[value.index()])
     }
 
     /// Write out whatever rax is still holding on behalf of its slot.
@@ -664,7 +678,7 @@ impl Lowering<'_> {
     }
 
     fn store(&mut self, value: ValueId, from: Reg) {
-        let Source::Slot(offset) = self.plan.source[value.0] else {
+        let Source::Slot(offset) = self.plan.source[value.index()] else {
             panic!("a computed value needs a slot");
         };
         self.asm.store_slot(from, offset);
@@ -692,7 +706,7 @@ impl Lowering<'_> {
         if dst.index() == Reg::Rax.index() {
             self.flush();
         }
-        match self.plan.source[value.0] {
+        match self.plan.source[value.index()] {
             Source::Const(constant) => self.load_const(dst, constant),
             Source::Addr(data) => self.load_addr(dst, data),
             Source::Slot(offset) => {
@@ -808,7 +822,7 @@ mod tests {
     #[test]
     fn constants_never_reach_the_stack() {
         let program = crate::hello_world();
-        let main = &program.functions()[program.entry().0];
+        let main = &program.functions()[program.entry().index()];
         assert_eq!(Plan::new(&program, main).frame, 0);
     }
 
@@ -816,12 +830,12 @@ mod tests {
     fn a_loop_jumps_backwards_to_its_own_head() {
         let program = entry(|b| {
             let start = b.constant(Class::Word, 1);
-            b.loop_(vec![start], Vec::new(), |b, params| {
+            b.loop_(&[start], &[], |b, params| {
                 let one = b.constant(Class::Word, 1);
                 let next = b.binary(Binary::Sub, params[0], one);
-                Terminator::Continue(vec![next])
+                b.continue_(&[next])
             });
-            Terminator::Unreachable
+            Terminator::UNREACHABLE
         });
 
         let bytes = lower(&program).bytes;
@@ -845,11 +859,11 @@ mod tests {
         program.define(main, |b, _| {
             let buf = b.address_of(data);
             let len = b.constant(Class::Word, 1);
-            b.platform_call(write, vec![buf, len]);
+            b.platform_call(write, &[buf, len]);
             // Leave with the status stdout had, so the two registers that
             // both held 1 across the syscall can be told apart.
             let status = b.constant(Class::Word, 1);
-            Terminator::Return(vec![status])
+            b.ret(&[status])
         });
 
         let bytes = lower(&program).bytes;

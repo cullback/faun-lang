@@ -11,12 +11,12 @@ use super::{
     R0, T0, T1,
 };
 use crate::ir::{
-    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Origin, Program, Region, Relation,
+    Binary, Class, DataId, Exit, FunctionId, Offset, Op, Origin, Program, RegionId, Relation,
     Terminator, ValueId, Width,
 };
 
 /// A word here is the width of an address.
-const WORD: i64 = 2;
+const WORD: i32 = 2;
 const WORD_BITS: u16 = 16;
 
 #[derive(Clone, Copy)]
@@ -64,7 +64,7 @@ fn assemble(program: &Program, heap: u16, far: Vec<bool>) -> (Code, Vec<usize>) 
         program,
         asm: Assembler::new(origin, far),
         data,
-        source: vec![Source::Slot(0); program.values()],
+        source: vec![Source::Slot(0); program.values_count()],
         frame: 0,
         starts: Vec::new(),
         loops: Vec::new(),
@@ -76,7 +76,7 @@ fn assemble(program: &Program, heap: u16, far: Vec<bool>) -> (Code, Vec<usize>) 
         .collect();
     state.reset(heap);
     for id in 0..program.functions().len() {
-        state.function(FunctionId(id));
+        state.function(FunctionId::at(id));
     }
 
     let (bytes, overflowed) = state.asm.finish();
@@ -115,7 +115,7 @@ impl Lowering<'_> {
         self.set_pair(FP, FRAMES_TOP);
         self.set_pair(HEAP, heap);
 
-        let entry = self.starts[self.program.entry().0];
+        let entry = self.starts[self.program.entry().index()];
         self.asm.jsr(entry);
         self.asm.lda_zp(R0);
         self.asm.jmp_abs(HOOK_EXIT);
@@ -130,12 +130,12 @@ impl Lowering<'_> {
     }
 
     fn function(&mut self, id: FunctionId) {
-        let function = &self.program.functions()[id.0];
-        let start = self.starts[id.0];
+        let function = &self.program.functions()[id.index()];
+        let start = self.starts[id.index()];
         self.asm.bind(start);
 
         self.frame = 0;
-        self.plan(&function.body);
+        self.plan(function.body);
         let frame = self.frame;
         if frame > 0 {
             self.adjust_frame(frame, true);
@@ -143,11 +143,12 @@ impl Lowering<'_> {
 
         // Arguments arrive in fixed pairs, so a callee takes its own copies
         // before anything it calls can overwrite them.
-        for (index, &param) in function.params.iter().enumerate() {
+        let params = self.program.values(function.params);
+        for (index, &param) in params.to_vec().iter().enumerate() {
             let pair = ARGS + 2 * u8::try_from(index).expect("a few arguments");
             self.write_slot(param, pair);
         }
-        self.region(&function.body);
+        self.region(function.body);
     }
 
     /// `FP` down by the frame, or back up again.
@@ -171,23 +172,30 @@ impl Lowering<'_> {
     }
 
     /// Give a slot to every value the frame has to hold.
-    fn plan(&mut self, region: &Region) {
-        for &param in &region.params {
+    fn plan(&mut self, region: RegionId) {
+        let program = self.program;
+        for &param in program.values(program.region(region).params) {
             self.give_slot(param);
         }
-        for inst in &region.instructions {
-            match &inst.op {
+
+        for (op, results) in program.walk(region) {
+            match *op {
                 Op::Constant { value, .. } => {
-                    self.source[inst.results[0].0] = Source::Const(*value);
+                    self.source[results[0].index()] = Source::Const(value);
                 }
-                Op::AddressOf(data) => self.source[inst.results[0].0] = Source::Addr(*data),
+                Op::AddressOf(data) => self.source[results[0].index()] = Source::Addr(data),
                 _ => {
-                    for &result in &inst.results {
+                    for &result in results {
                         self.give_slot(result);
                     }
                 }
             }
-            match &inst.op {
+        }
+
+        // The nested regions after the run they sit in, so each stays one
+        // scan rather than a walk interleaved with recursion.
+        for op in program.ops(region) {
+            match *op {
                 Op::If {
                     then_region,
                     else_region,
@@ -203,7 +211,7 @@ impl Lowering<'_> {
     }
 
     fn give_slot(&mut self, value: ValueId) {
-        self.source[value.0] = Source::Slot(self.frame);
+        self.source[value.index()] = Source::Slot(self.frame);
         self.frame = self
             .frame
             .checked_add(2)
@@ -212,7 +220,7 @@ impl Lowering<'_> {
 
     /// Read `value` into a zero-page pair.
     fn read(&mut self, pair: u8, value: ValueId) {
-        match self.source[value.0] {
+        match self.source[value.index()] {
             Source::Const(word) => {
                 let word = u16::try_from(word).expect("a word this target can hold");
                 self.set_pair(pair, word);
@@ -247,7 +255,7 @@ impl Lowering<'_> {
 
     /// Write a zero-page pair into `value`'s slot.
     fn write_slot(&mut self, value: ValueId, pair: u8) {
-        let Source::Slot(offset) = self.source[value.0] else {
+        let Source::Slot(offset) = self.source[value.index()] else {
             panic!("a computed value needs a slot");
         };
         self.asm.ldy_imm(offset);
@@ -260,25 +268,29 @@ impl Lowering<'_> {
 }
 
 impl Lowering<'_> {
-    fn region(&mut self, region: &Region) {
-        for inst in &region.instructions {
-            self.instruction(inst);
+    fn region(&mut self, region: RegionId) {
+        // The program outlives this, so the walk borrows it rather than
+        // `self`, and the loop stays one pass over a contiguous run.
+        let program = self.program;
+        for (op, results) in program.walk(region) {
+            self.instruction(op, results);
         }
-        self.terminator(&region.terminator);
+        self.terminator(program.region(region).terminator);
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "one call per op; the length is the patterns"
     )]
-    fn instruction(&mut self, inst: &Instruction) {
-        match &inst.op {
+    fn instruction(&mut self, op: &Op, results: &[ValueId]) {
+        let program = self.program;
+        match op {
             Op::Constant { .. } | Op::AddressOf(_) => {}
             Op::Binary { op, left, right } => {
                 self.pair(*left, *right);
-                let one_byte = bits(self.program.class(inst.results[0])) <= 8;
+                let one_byte = bits(self.program.class(results[0])) <= 8;
                 self.arithmetic(*op, one_byte);
-                self.write_slot(inst.results[0], T0);
+                self.write_slot(results[0], T0);
             }
             Op::Compare {
                 relation,
@@ -287,13 +299,13 @@ impl Lowering<'_> {
             } => {
                 self.pair(*left, *right);
                 self.comparison(*relation);
-                self.write_slot(inst.results[0], T0);
+                self.write_slot(results[0], T0);
             }
             Op::Load {
                 width,
                 address,
                 offset,
-            } => self.load_at(*width, *address, *offset, inst.results[0]),
+            } => self.load_at(*width, *address, *offset, results[0]),
             Op::Store {
                 width,
                 address,
@@ -301,19 +313,23 @@ impl Lowering<'_> {
                 value,
             } => self.store_at(*width, *address, *offset, *value),
             Op::Convert { class, value } => {
-                self.convert(*class, *value, inst.results[0]);
+                self.convert(*class, *value, results[0]);
             }
             Op::PlatformCall { platform, args } => {
-                let name = self.program.platforms()[platform.0].name.clone();
-                self.platform_call(&name, args, &inst.results);
+                let name = &program.platforms()[platform.index()].name;
+                self.platform_call(name, program.values(*args), results);
             }
-            Op::Call { function, args } => self.call(*function, args, &inst.results),
+            Op::Call { function, args } => {
+                self.call(*function, program.values(*args), results);
+            }
             Op::If {
                 condition,
                 then_region,
                 else_region,
-            } => self.conditional(*condition, then_region, else_region, &inst.results),
-            Op::Loop { initial, body } => self.repeat(initial, body, &inst.results),
+            } => self.conditional(*condition, *then_region, *else_region, results),
+            Op::Loop { initial, body } => {
+                self.repeat(program.values(*initial), *body, results);
+            }
         }
     }
 
@@ -336,7 +352,7 @@ impl Lowering<'_> {
             assert!(index < ARG_COUNT, "at most four arguments");
             self.read(ARGS + 2 * index, arg);
         }
-        let target = self.starts[function.0];
+        let target = self.starts[function.index()];
         self.asm.jsr(target);
         if let Some(&result) = results.first() {
             self.write_slot(result, R0);
@@ -415,26 +431,28 @@ impl Lowering<'_> {
 }
 
 impl Lowering<'_> {
-    fn terminator(&mut self, terminator: &Terminator) {
-        match terminator {
-            Terminator::Yield(values) => {
+    fn terminator(&mut self, terminator: Terminator) {
+        let program = self.program;
+        let values = program.values(terminator.values);
+        match terminator.exit {
+            Exit::Yield => {
                 let (results, end) = self.ifs.last().expect("a yield inside an if").clone();
                 self.transfer(values, &results);
                 self.asm.jmp(end);
             }
-            Terminator::Continue(values) => {
+            Exit::Continue => {
                 let frame = self.loops.last().expect("a continue inside a loop");
                 let (params, head) = (frame.0.clone(), frame.1);
                 self.transfer(values, &params);
                 self.asm.jmp(head);
             }
-            Terminator::Break(values) => {
+            Exit::Break => {
                 let frame = self.loops.last().expect("a break inside a loop");
                 let (results, end) = (frame.2.clone(), frame.3);
                 self.transfer(values, &results);
                 self.asm.jmp(end);
             }
-            Terminator::Return(values) => {
+            Exit::Return => {
                 if let Some(&value) = values.first() {
                     self.read(R0, value);
                 }
@@ -445,7 +463,7 @@ impl Lowering<'_> {
                 self.asm.rts();
             }
             // Nothing follows, so nothing has to be emitted to avoid it.
-            Terminator::Unreachable => self.asm.rts(),
+            Exit::Unreachable => self.asm.rts(),
         }
     }
 
@@ -464,8 +482,8 @@ impl Lowering<'_> {
     fn conditional(
         &mut self,
         condition: ValueId,
-        then_region: &Region,
-        else_region: &Region,
+        then_region: RegionId,
+        else_region: RegionId,
         results: &[ValueId],
     ) {
         let otherwise = self.asm.label();
@@ -484,14 +502,16 @@ impl Lowering<'_> {
         self.asm.bind(end);
     }
 
-    fn repeat(&mut self, initial: &[ValueId], body: &Region, results: &[ValueId]) {
+    fn repeat(&mut self, initial: &[ValueId], body: RegionId, results: &[ValueId]) {
         let head = self.asm.label();
         let end = self.asm.label();
 
-        self.transfer(initial, &body.params);
+        let program = self.program;
+        let params = program.values(program.region(body).params);
+        self.transfer(initial, params);
         self.asm.bind(head);
         self.loops
-            .push((body.params.clone(), head, results.to_vec(), end));
+            .push((params.to_vec(), head, results.to_vec(), end));
         self.region(body);
         self.loops.pop();
         self.asm.bind(end);
