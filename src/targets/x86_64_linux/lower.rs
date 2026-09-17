@@ -9,13 +9,25 @@
 use super::encode::{Encoder, Reg};
 use super::{Code, Reloc};
 use crate::ir::{
-    Binary, DataId, Function, FunctionId, Instruction, Op, PlatformId, Program, Region, Relation,
-    Terminator, ValueId,
+    Binary, DataId, Function, FunctionId, Instruction, Offset, Op, PlatformId, Program, Region,
+    Relation, Terminator, ValueId, Width,
 };
 
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 60;
+const SYS_MMAP: u64 = 9;
 const STDOUT: u64 = 1;
+
+/// `mmap`: readable and writable, private, and backed by nothing.
+const PROT_READ_WRITE: u64 = 0x3;
+const MAP_PRIVATE_ANONYMOUS: u64 = 0x22;
+
+/// A word in bytes, which is what [`Offset::Words`] counts.
+const WORD: i64 = 8;
+
+/// A syscall's fourth argument goes in r10, where the ordinary convention
+/// would use rcx.
+const SYSCALL_REGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::R10, Reg::R8, Reg::R9];
 
 /// System V, so that adding C interop later changes nothing here.
 const ARG_REGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
@@ -27,7 +39,17 @@ const BELOW: u8 = 0x2;
 /// `syscall` returns in rax and destroys rcx and r11.
 const CLOBBERED: [Reg; 3] = [Reg::Rax, Reg::Rcx, Reg::R11];
 
-const TRACKED: [Reg; 6] = [Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi, Reg::Rdi, Reg::R11];
+const TRACKED: [Reg; 9] = [
+    Reg::Rax,
+    Reg::Rcx,
+    Reg::Rdx,
+    Reg::Rsi,
+    Reg::Rdi,
+    Reg::R8,
+    Reg::R9,
+    Reg::R10,
+    Reg::R11,
+];
 
 #[derive(Clone, Copy)]
 enum Source {
@@ -134,6 +156,15 @@ impl Plan {
     }
 }
 
+/// A byte distance, which is what the machine addresses in.
+fn displacement(offset: Offset) -> i32 {
+    let bytes = match offset {
+        Offset::Bytes(bytes) => bytes,
+        Offset::Words(words) => words * WORD,
+    };
+    i32::try_from(bytes).expect("an offset within 2 GiB")
+}
+
 /// The values a terminator moves through scratch. `Return` is not among
 /// them: it reads straight into the register it leaves by, so counting it
 /// would buy a frame that nothing writes to.
@@ -206,25 +237,36 @@ impl Lowering<'_> {
         self.terminator(&region.terminator);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one call per op; the length is the patterns"
+    )]
     fn instruction(&mut self, inst: &Instruction) {
         match &inst.op {
             // Materialised where they are read, never where they are written.
             Op::Constant { .. } | Op::AddressOf(_) => {}
             Op::Binary { op, left, right } => {
-                let opcode = match op {
-                    Binary::Add => 0x01,
-                    Binary::Sub => 0x29,
-                };
-                self.pair(*left, *right);
-                self.asm.alu(opcode, Reg::Rax, Reg::Rcx);
-                self.keep(inst.results[0]);
+                self.binary(*op, *left, *right, inst.results[0]);
             }
             Op::Compare {
                 relation,
                 left,
                 right,
             } => self.compare(*relation, *left, *right, inst.results[0]),
-            Op::PlatformCall { platform, args } => self.platform_call(*platform, args),
+            Op::Load {
+                width,
+                address,
+                offset,
+            } => self.load_at(*width, *address, *offset, inst.results[0]),
+            Op::Store {
+                width,
+                address,
+                offset,
+                value,
+            } => self.store_at(*width, *address, *offset, *value),
+            Op::PlatformCall { platform, args } => {
+                self.platform_call(*platform, args, &inst.results);
+            }
             Op::Call { function, args } => {
                 for (&arg, reg) in args.iter().zip(ARG_REGS) {
                     self.read(reg, arg);
@@ -258,7 +300,41 @@ impl Lowering<'_> {
         self.keep(result);
     }
 
-    fn platform_call(&mut self, platform: PlatformId, args: &[ValueId]) {
+    fn binary(&mut self, op: Binary, left: ValueId, right: ValueId, result: ValueId) {
+        let opcode = match op {
+            Binary::Add => 0x01,
+            Binary::Sub => 0x29,
+        };
+        self.pair(left, right);
+        self.asm.alu(opcode, Reg::Rax, Reg::Rcx);
+        self.keep(result);
+    }
+
+    fn load_at(&mut self, width: Width, address: ValueId, offset: Offset, result: ValueId) {
+        self.read(Reg::Rcx, address);
+        let disp = displacement(offset);
+        match width {
+            Width::Byte => self.asm.load_byte(Reg::Rax, Reg::Rcx, disp),
+            Width::Word => self.asm.load_word(Reg::Rax, Reg::Rcx, disp),
+        }
+        self.keep(result);
+    }
+
+    fn store_at(&mut self, width: Width, address: ValueId, offset: Offset, value: ValueId) {
+        self.read(Reg::Rax, value);
+        self.read(Reg::Rcx, address);
+        match width {
+            Width::Byte => self
+                .asm
+                .store_byte(Reg::Rax, Reg::Rcx, displacement(offset)),
+            Width::Word => self
+                .asm
+                .store_word(Reg::Rax, Reg::Rcx, displacement(offset)),
+        }
+        self.known[Reg::Rax.index()] = None;
+    }
+
+    fn platform_call(&mut self, platform: PlatformId, args: &[ValueId], results: &[ValueId]) {
         match self.program.platforms()[platform.0].name.as_str() {
             "write" => {
                 // rax first, so stdout can be copied from it.
@@ -271,9 +347,22 @@ impl Lowering<'_> {
                 self.load_const(Reg::Rax, SYS_EXIT);
                 self.read(Reg::Rdi, args[0]);
             }
+            // The kernel picks the address, so nothing here has to.
+            "alloc" => {
+                self.load_const(Reg::Rax, SYS_MMAP);
+                self.load_const(SYSCALL_REGS[0], 0);
+                self.read(SYSCALL_REGS[1], args[0]);
+                self.load_const(SYSCALL_REGS[2], PROT_READ_WRITE);
+                self.load_const(SYSCALL_REGS[3], MAP_PRIVATE_ANONYMOUS);
+                self.load_const(SYSCALL_REGS[4], u64::MAX);
+                self.load_const(SYSCALL_REGS[5], 0);
+            }
             other => panic!("this target provides no `{other}`"),
         }
         self.syscall();
+        if let Some(&result) = results.first() {
+            self.keep(result);
+        }
     }
 
     fn conditional(

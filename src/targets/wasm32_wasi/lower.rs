@@ -9,7 +9,8 @@
 
 use super::{Body, CALL, Code, DROP, END, I32_CONST, Segment};
 use crate::ir::{
-    Binary, DataId, FunctionId, Instruction, Op, Program, Region, Relation, Terminator, ValueId,
+    Binary, DataId, FunctionId, Instruction, Offset, Op, Program, Region, Relation, Terminator,
+    ValueId, Width,
 };
 use crate::targets::bytes::{Bytes, len32};
 
@@ -30,7 +31,17 @@ const BR: u8 = 0x0C;
 const RETURN: u8 = 0x0F;
 const LOCAL_GET: u8 = 0x20;
 const LOCAL_SET: u8 = 0x21;
+const I32_LOAD: u8 = 0x28;
+const I32_LOAD8_U: u8 = 0x2D;
 const I32_STORE: u8 = 0x36;
+const I32_STORE8: u8 = 0x3A;
+const I32_SHL: u8 = 0x74;
+const I32_SHR_U: u8 = 0x76;
+const MEMORY_GROW: u8 = 0x40;
+
+/// A word on this target, in bytes, and a page as a power of two.
+const WORD: i64 = 4;
+const PAGE_BITS: i32 = 16;
 const I32_ADD: u8 = 0x6A;
 const I32_SUB: u8 = 0x6B;
 const I32_EQ: u8 = 0x46;
@@ -248,6 +259,10 @@ impl Lowering<'_> {
         self.terminator(&region.terminator);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one call per op; the length is the patterns"
+    )]
     fn instruction(&mut self, inst: &Instruction) {
         match &inst.op {
             Op::Constant { .. } | Op::AddressOf(_) => {}
@@ -269,7 +284,20 @@ impl Lowering<'_> {
                 };
                 self.binary(opcode, *left, *right, inst.results[0]);
             }
-            Op::PlatformCall { platform, args } => self.platform_call(*platform, args),
+            Op::Load {
+                width,
+                address,
+                offset,
+            } => self.load_at(*width, *address, *offset, inst.results[0]),
+            Op::Store {
+                width,
+                address,
+                offset,
+                value,
+            } => self.store_at(*width, *address, *offset, *value),
+            Op::PlatformCall { platform, args } => {
+                self.platform_call(*platform, args, &inst.results);
+            }
             Op::Call { function, args } => {
                 for &arg in args {
                     self.push(arg);
@@ -287,6 +315,18 @@ impl Lowering<'_> {
             } => self.conditional(*condition, then_region, else_region, &inst.results),
             Op::Loop { initial, body } => self.repeat(initial, body, &inst.results),
         }
+    }
+
+    fn load_at(&mut self, width: Width, address: ValueId, offset: Offset, result: ValueId) {
+        self.push(address);
+        self.access(width, offset, I32_LOAD8_U, I32_LOAD);
+        self.set(result);
+    }
+
+    fn store_at(&mut self, width: Width, address: ValueId, offset: Offset, value: ValueId) {
+        self.push(address);
+        self.push(value);
+        self.access(width, offset, I32_STORE8, I32_STORE);
     }
 
     fn binary(&mut self, opcode: u8, left: ValueId, right: ValueId, result: ValueId) {
@@ -383,7 +423,29 @@ impl Lowering<'_> {
         }
     }
 
-    fn platform_call(&mut self, platform: crate::ir::PlatformId, args: &[ValueId]) {
+    /// The opcode for the width, then its alignment as a power of two and
+    /// the constant part of its address.
+    fn access(&mut self, width: Width, offset: Offset, byte: u8, word: u8) {
+        let bytes = match offset {
+            Offset::Bytes(bytes) => bytes,
+            Offset::Words(words) => words * WORD,
+        };
+        let (opcode, align) = match width {
+            Width::Byte => (byte, 0),
+            Width::Word => (word, 2),
+        };
+        self.body.byte(opcode);
+        self.body.uleb(align);
+        self.body
+            .uleb(u32::try_from(bytes).expect("a non-negative offset in range"));
+    }
+
+    fn platform_call(
+        &mut self,
+        platform: crate::ir::PlatformId,
+        args: &[ValueId],
+        results: &[ValueId],
+    ) {
         match self.program.platforms()[platform.0].name.as_str() {
             "write" => {
                 let index = self.written;
@@ -413,6 +475,20 @@ impl Lowering<'_> {
                     self.push(args[0]);
                     self.call(index);
                 }
+            }
+            // Linear memory only grows in pages, and `memory.grow` answers
+            // with the old size, so the new region starts where it ended.
+            "alloc" => {
+                self.push(args[0]);
+                self.constant_i32((1 << PAGE_BITS) - 1);
+                self.body.byte(I32_ADD);
+                self.constant_i32(PAGE_BITS);
+                self.body.byte(I32_SHR_U);
+                self.body.byte(MEMORY_GROW);
+                self.body.uleb(0);
+                self.constant_i32(PAGE_BITS);
+                self.body.byte(I32_SHL);
+                self.set(results[0]);
             }
             other => panic!("this target provides no `{other}`"),
         }

@@ -11,6 +11,7 @@ pub(super) enum Reg {
     Rdi = 7,
     R8 = 8,
     R9 = 9,
+    R10 = 10,
     R11 = 11,
 }
 
@@ -90,6 +91,33 @@ impl Encoder {
     pub(super) fn mov_imm64(&mut self, dst: Reg, value: u64) {
         self.emit(&[0x48 | u8::from(dst.extended()), 0xB8 + dst.low()]);
         self.emit(&value.to_le_bytes());
+    }
+
+    /// `dst = [base + disp]` and its mirror, in whole words. A `ModRM` mod
+    /// of 10 takes a 32-bit displacement; rsp and rbp are not addressable
+    /// this way, and nothing here asks to be.
+    pub(super) fn load_word(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.at(&[0x8B], dst, base, disp);
+    }
+
+    pub(super) fn store_word(&mut self, src: Reg, base: Reg, disp: i32) {
+        self.at(&[0x89], src, base, disp);
+    }
+
+    /// The low byte, zero-extended on the way in.
+    pub(super) fn load_byte(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.at(&[0x0F, 0xB6], dst, base, disp);
+    }
+
+    pub(super) fn store_byte(&mut self, src: Reg, base: Reg, disp: i32) {
+        self.at(&[0x88], src, base, disp);
+    }
+
+    fn at(&mut self, opcode: &[u8], reg: Reg, base: Reg, disp: i32) {
+        self.rex(true, Some(reg), base);
+        self.emit(opcode);
+        self.emit(&[0x80 | (reg.low() << 3) | base.low()]);
+        self.emit(&disp.to_le_bytes());
     }
 
     pub(super) fn syscall(&mut self) {

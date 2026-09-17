@@ -51,6 +51,20 @@ pub enum Binary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Width {
+    Byte,
+    Word,
+}
+
+/// A distance from an address, in units the target scales. `Words` is how a
+/// machine with a word narrower than 64 bits keeps its own stride.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offset {
+    Bytes(i64),
+    Words(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Relation {
     Equal,
     /// Unsigned, like every comparison on a word.
@@ -73,6 +87,17 @@ pub enum Op {
         relation: Relation,
         left: ValueId,
         right: ValueId,
+    },
+    Load {
+        width: Width,
+        address: ValueId,
+        offset: Offset,
+    },
+    Store {
+        width: Width,
+        address: ValueId,
+        offset: Offset,
+        value: ValueId,
     },
     PlatformCall {
         platform: PlatformId,
@@ -296,6 +321,25 @@ impl Builder<'_> {
             right,
         };
         self.push(op, vec![Class::Word])[0]
+    }
+
+    pub fn load(&mut self, width: Width, address: ValueId, offset: Offset) -> ValueId {
+        let op = Op::Load {
+            width,
+            address,
+            offset,
+        };
+        self.push(op, vec![Class::Word])[0]
+    }
+
+    pub fn store(&mut self, width: Width, address: ValueId, offset: Offset, value: ValueId) {
+        let op = Op::Store {
+            width,
+            address,
+            offset,
+            value,
+        };
+        self.push(op, Vec::new());
     }
 
     pub fn platform_call(&mut self, platform: PlatformId, args: Vec<ValueId>) -> Vec<ValueId> {

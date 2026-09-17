@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 
 use faun::ir::Class::Word;
-use faun::ir::{Binary, Class, Program, Relation, Terminator};
+use faun::ir::{Binary, Class, Offset, Program, Relation, Terminator, Width};
 use faun::targets::Target;
 
 #[test]
@@ -40,6 +40,19 @@ fn the_smallest_wasm32_wasi_module_imports_nothing() {
     assert_eq!(output, "");
     // Type, function, export, code. No imports, no memory, no data.
     assert_eq!(bytes, 39);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn the_x86_64_linux_executable_uses_the_heap() {
+    assert_eq!(status(Target::X86_64Linux, &uses_the_heap()), 42);
+    assert_eq!(status(Target::X86_64Linux, &stores_a_byte()), 8);
+}
+
+#[test]
+fn the_wasm32_wasi_module_uses_the_heap() {
+    assert_eq!(status(Target::Wasm32Wasi, &uses_the_heap()), 42);
+    assert_eq!(status(Target::Wasm32Wasi, &stores_a_byte()), 8);
 }
 
 /// A call and a return, on each target's own calling convention.
@@ -148,6 +161,51 @@ fn recurses() -> Program {
     program
 }
 
+/// Ask the platform for a page, write two words into it, read one back.
+/// Exits with what it read, so nothing but real memory can make it pass.
+fn uses_the_heap() -> Program {
+    let (mut program, main) = Program::new("main");
+    let alloc = program.platform("alloc", vec![Word], vec![Class::Address]);
+
+    program.define(main, |b, _| {
+        let size = b.constant(Word, 4096);
+        let page = b.platform_call(alloc, vec![size])[0];
+
+        let answer = b.constant(Word, 42);
+        let decoy = b.constant(Word, 7);
+        b.store(Width::Word, page, Offset::Words(0), decoy);
+        b.store(Width::Word, page, Offset::Words(1), answer);
+
+        Terminator::Return(vec![b.load(Width::Word, page, Offset::Words(1))])
+    });
+    program
+}
+
+/// A byte store must not disturb its neighbour, and a byte above 127 must
+/// come back zero-extended rather than as a very large word. Answers
+/// `(first == 200) + second`, so both have to hold to reach 8.
+fn stores_a_byte() -> Program {
+    let (mut program, main) = Program::new("main");
+    let alloc = program.platform("alloc", vec![Word], vec![Class::Address]);
+
+    program.define(main, |b, _| {
+        let size = b.constant(Word, 4096);
+        let page = b.platform_call(alloc, vec![size])[0];
+
+        let high = b.constant(Word, 200);
+        b.store(Width::Byte, page, Offset::Bytes(0), high);
+        let neighbour = b.constant(Word, 7);
+        b.store(Width::Byte, page, Offset::Bytes(1), neighbour);
+
+        let first = b.load(Width::Byte, page, Offset::Bytes(0));
+        let second = b.load(Width::Byte, page, Offset::Bytes(1));
+        let expected = b.constant(Word, 200);
+        let intact = b.compare(Relation::Equal, first, expected);
+        Terminator::Return(vec![b.binary(Binary::Add, intact, second)])
+    });
+    program
+}
+
 /// `Relation::Less` is unsigned, and both targets carry an arm for it that
 /// nothing else exercises.
 fn less(left: u64, right: u64) -> Program {
@@ -197,6 +255,8 @@ fn countdown(times: u64) -> Program {
 }
 
 /// The exit status a program leaves with, which is what `main` returns.
+/// WASI rejects anything outside `[0, 126)`, so a test that wants to check a
+/// larger number has to reduce it to a small one first.
 fn status(target: Target, program: &Program) -> i32 {
     execute(target, program).0
 }
