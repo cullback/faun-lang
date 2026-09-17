@@ -33,6 +33,21 @@ fn list(program: &Program, list: TypeId, byte: TypeId, bytes: &[u8]) -> Value {
 }
 
 #[test]
+fn a_name_is_interned_once_and_reads_back() {
+    let (mut program, nat, byte, list) = types();
+    // `Zero` names a constructor of both `Nat` and `U8`; it is one symbol.
+    let on_nat = program.ctor(program.ctor_at(nat, 0)).name;
+    let on_byte = program.ctor(program.ctor_at(byte, 0)).name;
+    assert_eq!(on_nat, on_byte, "one name, one symbol");
+    assert_eq!(program.name(on_nat), "Zero");
+    assert_eq!(program.name(program.type_(list).name), "List_U8");
+
+    // Interning is idempotent, so a name costs one entry however often it is
+    // written, and asking for one already held answers what is already there.
+    assert_eq!(program.symbol("Zero"), on_nat);
+}
+
+#[test]
 fn a_term_stays_small() {
     assert_eq!(size_of::<Expr>(), 16);
     assert_eq!(size_of::<Arm>(), 8);

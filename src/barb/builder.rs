@@ -7,6 +7,7 @@
 
 use super::constant;
 use super::ir::{Arm, Atom, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local};
+use super::ir::{Name, Symbol};
 use super::ir::{Program, Range, Type, TypeId};
 use constant::{Shape, Value};
 
@@ -16,11 +17,29 @@ impl Program {
         Self::default()
     }
 
+    /// The symbol for `name`, the same symbol every time.
+    ///
+    /// A scan rather than a table beside it: only declarations are named, so
+    /// there are as many of these as a program has types, constructors and
+    /// functions, and a program stays a plain bag of pools.
+    ///
+    /// # Panics
+    ///
+    /// If the program outgrew the names it may have.
+    pub fn symbol(&mut self, name: &str) -> Name {
+        if let Some(at) = self.names.iter().position(|held| held == name) {
+            return Symbol::at(at);
+        }
+        self.names.push(name.to_owned());
+        Symbol::at(self.names.len() - 1)
+    }
+
     /// Reserve a type. Its constructors follow, so that a field may name the
     /// type being declared.
     pub fn declare_type(&mut self, name: &str) -> TypeId {
+        let name = self.symbol(name);
         self.types.push(Type {
-            name: name.to_owned(),
+            name,
             ctors: Range::default(),
         });
         TypeId::at(self.types.len() - 1)
@@ -34,10 +53,11 @@ impl Program {
     pub fn define_type(&mut self, id: TypeId, ctors: &[(&str, &[TypeId])]) {
         let start = self.ctors.len();
         for (name, fields) in ctors {
+            let name = self.symbol(name);
             let at = self.types_pool.len();
             self.types_pool.extend_from_slice(fields);
             self.ctors.push(Ctor {
-                name: (*name).to_owned(),
+                name,
                 owner: id,
                 fields: Range::of(at, fields.len()),
             });
@@ -49,10 +69,11 @@ impl Program {
     ///
     /// If the program outgrew the pools it may have.
     pub fn declare(&mut self, name: &str, params: &[TypeId], result: TypeId) -> FnId {
+        let name = self.symbol(name);
         let at = self.types_pool.len();
         self.types_pool.extend_from_slice(params);
         self.functions.push(Function {
-            name: name.to_owned(),
+            name,
             params: Range::of(at, params.len()),
             result,
             body: ExprId(0),
@@ -84,14 +105,15 @@ impl Program {
     ///
     /// If `id` is not a number: a spine whose elements carry nothing.
     pub fn intern_number(&mut self, id: TypeId, value: u64) -> ConstId {
+        let name = self.type_(id).name;
         let Shape::Spine { cons, .. } = constant::shape(self, id) else {
-            panic!("`{}` is not a number", self.type_(id).name);
+            panic!("`{}` is not a number", self.name(name));
         };
         assert_eq!(
             self.fields(cons).len(),
             1,
             "`{}` carries something per element",
-            self.type_(id).name
+            self.name(name)
         );
         let mut bytes = Vec::new();
         constant::write_number(value, &mut bytes);
@@ -104,8 +126,9 @@ impl Program {
     ///
     /// If `id` is not a spine of numbers.
     pub fn intern_bytes(&mut self, id: TypeId, value: &[u8]) -> ConstId {
+        let name = self.type_(id).name;
         let Shape::Spine { cons, .. } = constant::shape(self, id) else {
-            panic!("`{}` is not a sequence", self.type_(id).name);
+            panic!("`{}` is not a sequence", self.name(name));
         };
         let element = self
             .fields(cons)
@@ -115,7 +138,7 @@ impl Program {
         assert!(
             element.is_some_and(|field| constant::as_number(self, field, &[0]).is_some()),
             "`{}` does not hold numbers",
-            self.type_(id).name
+            self.name(name)
         );
         let mut bytes = Vec::new();
         constant::write_bytes(value, &mut bytes);

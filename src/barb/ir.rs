@@ -2,7 +2,7 @@
 
 use crate::index::index;
 
-index!(ExprId, FnId, TypeId, CtorId, ConstId, Local);
+index!(ExprId, FnId, TypeId, CtorId, ConstId, Local, Symbol);
 
 /// A run of values in one of the pools beside the arena.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,6 +37,15 @@ impl Range {
         start..start + self.len()
     }
 }
+
+/// A name, interned. The IR never reads the characters of one: names are
+/// compared, hashed and copied as integers, and the string is read back only
+/// to render it or to mint a related name.
+///
+/// The table belongs to the program, like every other pool here, so a
+/// program is a self-contained value and two of them cannot disagree about
+/// what a symbol means.
+pub type Name = Symbol;
 
 /// An argument: a local, and nothing else. That is what A-normal form buys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,13 +83,13 @@ pub struct Arm {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Type {
-    pub name: String,
+    pub name: Name,
     pub ctors: Range,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ctor {
-    pub name: String,
+    pub name: Name,
     pub owner: TypeId,
     /// The types of its fields, in order.
     pub fields: Range,
@@ -88,7 +97,7 @@ pub struct Ctor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
-    pub name: String,
+    pub name: Name,
     /// The types of its parameters, which are the first locals.
     pub params: Range,
     pub result: TypeId,
@@ -111,10 +120,22 @@ pub struct Program {
     /// Known values, encoded. See [`super::constant`].
     pub(super) consts: Vec<Range>,
     pub(super) bytes: Vec<u8>,
+    /// Every name the program uses, each once.
+    pub(super) names: Vec<String>,
     pub(super) entry: Option<FnId>,
 }
 
 impl Program {
+    /// The name a symbol stands for.
+    ///
+    /// # Panics
+    ///
+    /// If the symbol came from another program.
+    #[must_use]
+    pub fn name(&self, symbol: Name) -> &str {
+        &self.names[symbol.index()]
+    }
+
     /// How many locals a body binds, parameters included: the deepest chain
     /// of binders in it, since sibling arms take the same levels back and a
     /// `let`'s value is bound outside its own binding.
