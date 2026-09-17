@@ -133,6 +133,27 @@ impl Program {
         Range::of(at, classes.len())
     }
 
+    /// One value of `class`, and the run of one that names it.
+    fn mint_one(&mut self, class: Class) -> (ValueId, Range) {
+        let start = self.operands.len();
+        self.classes.push(class);
+        let value = ValueId::at(self.classes.len() - 1);
+        self.operands.push(value);
+        (value, Range::of(start, 1))
+    }
+
+    /// A run of values for the classes a signature already names, read where
+    /// they lie rather than copied out first.
+    fn mint_from(&mut self, signature: Range) -> Range {
+        let start = self.operands.len();
+        for at in signature.range() {
+            let class = self.signature[at];
+            self.classes.push(class);
+            self.operands.push(ValueId::at(self.classes.len() - 1));
+        }
+        Range::of(start, signature.len())
+    }
+
     fn mint(&mut self, classes: &[Class]) -> Range {
         let start = u32::try_from(self.operands.len()).expect("a program within 4G operands");
         for &class in classes {
@@ -162,7 +183,7 @@ pub struct Builder<'a> {
 impl Builder<'_> {
     pub fn constant(&mut self, class: Class, value: u64) -> ValueId {
         let value = wrap(class, value);
-        self.push(Op::Constant { class, value }, &[class])[0]
+        self.push_one(Op::Constant { class, value }, class)
     }
 
     /// The same word, written the way a negative number reads.
@@ -171,7 +192,7 @@ impl Builder<'_> {
     }
 
     pub fn address_of(&mut self, data: DataId) -> ValueId {
-        self.push(Op::AddressOf(data), &[Class::Address])[0]
+        self.push_one(Op::AddressOf(data), Class::Address)
     }
 
     pub fn data_len(&mut self, data: DataId) -> ValueId {
@@ -181,7 +202,7 @@ impl Builder<'_> {
 
     pub fn binary(&mut self, op: Binary, left: ValueId, right: ValueId) -> ValueId {
         let class = self.program.class(left);
-        self.push(Op::Binary { op, left, right }, &[class])[0]
+        self.push_one(Op::Binary { op, left, right }, class)
     }
 
     pub fn compare(&mut self, relation: Relation, left: ValueId, right: ValueId) -> ValueId {
@@ -190,7 +211,7 @@ impl Builder<'_> {
             left,
             right,
         };
-        self.push(op, &[Class::Word])[0]
+        self.push_one(op, Class::Word)
     }
 
     pub fn load(&mut self, width: Width, address: ValueId, offset: Offset) -> ValueId {
@@ -199,7 +220,7 @@ impl Builder<'_> {
             address,
             offset,
         };
-        self.push(op, &[Class::Word])[0]
+        self.push_one(op, Class::Word)
     }
 
     pub fn store(&mut self, width: Width, address: ValueId, offset: Offset, value: ValueId) {
@@ -213,7 +234,7 @@ impl Builder<'_> {
     }
 
     pub fn convert(&mut self, class: Class, value: ValueId) -> ValueId {
-        self.push(Op::Convert { class, value }, &[class])[0]
+        self.push_one(Op::Convert { class, value }, class)
     }
 
     pub fn platform_call(&mut self, platform: PlatformId, args: &[ValueId]) -> Vec<ValueId> {
@@ -310,8 +331,21 @@ impl Builder<'_> {
 
     /// The same, for results a signature already names.
     fn push_from(&mut self, op: Op, returns: Range) -> Vec<ValueId> {
-        let classes: Vec<Class> = self.program.signature(returns).to_vec();
-        self.push(op, &classes)
+        let results = self.program.mint_from(returns);
+        let values = self.program.values(results).to_vec();
+        self.ops.push(op);
+        self.results.push(results);
+        values
+    }
+
+    /// One result, which is every operation but a call and a construct that
+    /// carries values out. Answers the value itself, so that the common case
+    /// never builds a list to take the first of.
+    fn push_one(&mut self, op: Op, class: Class) -> ValueId {
+        let (value, results) = self.program.mint_one(class);
+        self.ops.push(op);
+        self.results.push(results);
+        value
     }
 
     fn push(&mut self, op: Op, classes: &[Class]) -> Vec<ValueId> {
