@@ -36,8 +36,8 @@ mod pretty;
 pub use builder::Builder;
 pub use constant::{Shape, Value, as_bytes, as_number, decode, shape};
 pub use ir::{
-    Arm, Atom, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local, Program, Range, Symbol,
-    Type, TypeId,
+    Arm, Atom, Body, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local, Program, Range,
+    Symbol, Type, TypeId,
 };
 
 #[cfg(test)]

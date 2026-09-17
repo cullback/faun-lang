@@ -64,17 +64,26 @@ pub enum Expr {
     Static(TypeId, ConstId),
     /// A saturated call to a top-level name. Every recursive edge is one.
     Call(FnId, Range),
-    /// Binds the next local to the first, and continues with the second.
-    Let(ExprId, ExprId),
     /// Destructuring. An arm per constructor of the scrutinee's type.
     Match(Atom, Range),
+}
+
+/// A run of bindings and the expression they are for. Each binding takes the
+/// next local, in order, and the tail answers the body's value.
+///
+/// This is the shape of [`crate::ir::Region`] one tier down, so that lowering
+/// a body is a scan rather than a change of shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Body {
+    pub bindings: Range,
+    pub tail: ExprId,
 }
 
 /// One branch of a match. Binds its constructor's fields as the next locals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Arm {
     pub ctor: CtorId,
-    pub body: ExprId,
+    pub body: Body,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +106,7 @@ pub struct Function {
     /// The types of its parameters, which are the first locals.
     pub params: Range,
     pub result: TypeId,
-    pub body: ExprId,
+    pub body: Body,
 }
 
 /// A program, and the pools every part of it lives in.
@@ -110,6 +119,8 @@ pub struct Program {
     pub(super) exprs: Vec<Expr>,
     /// Argument lists, for `Con` and `Call`.
     pub(super) atoms: Vec<Atom>,
+    /// The bindings of every body, each run contiguous.
+    pub(super) bindings: Vec<ExprId>,
     pub(super) arms: Vec<Arm>,
     /// Field and parameter types.
     pub(super) types_pool: Vec<TypeId>,
@@ -155,26 +166,33 @@ impl Program {
     /// If a constructor outgrew the fields it may have.
     #[must_use]
     pub fn locals(&self, id: FnId) -> u32 {
-        fn deepest(program: &Program, expr: ExprId, at: u32) -> u32 {
-            match program.expr(expr) {
-                Expr::Let(value, body) => {
-                    deepest(program, value, at).max(deepest(program, body, at + 1))
-                }
-                Expr::Match(_, arms) => program
-                    .arms(arms)
-                    .iter()
-                    .map(|arm| {
-                        let bound = u32::try_from(program.fields(arm.ctor).len())
-                            .expect("a sane constructor arity");
-                        deepest(program, arm.body, at + bound)
-                    })
-                    .max()
-                    .unwrap_or(at),
-                _ => at,
+        fn in_body(program: &Program, body: Body, at: u32) -> u32 {
+            let mut level = at;
+            let mut deepest = at;
+            for &binding in program.bindings(body.bindings) {
+                deepest = deepest.max(in_expr(program, binding, level));
+                level += 1;
+                deepest = deepest.max(level);
             }
+            deepest.max(in_expr(program, body.tail, level))
+        }
+        fn in_expr(program: &Program, expr: ExprId, at: u32) -> u32 {
+            let Expr::Match(_, arms) = program.expr(expr) else {
+                return at;
+            };
+            program
+                .arms(arms)
+                .iter()
+                .map(|arm| {
+                    let bound = u32::try_from(program.fields(arm.ctor).len())
+                        .expect("a sane constructor arity");
+                    in_body(program, arm.body, at + bound)
+                })
+                .max()
+                .unwrap_or(at)
         }
         let params = u32::try_from(self.params(id).len()).expect("a sane arity");
-        deepest(self, self.function(id).body, params)
+        in_body(self, self.function(id).body, params)
     }
 
     #[must_use]
@@ -228,6 +246,11 @@ impl Program {
     #[must_use]
     pub fn params(&self, id: FnId) -> &[TypeId] {
         &self.types_pool[self.function(id).params.range()]
+    }
+
+    #[must_use]
+    pub fn bindings(&self, range: Range) -> &[ExprId] {
+        &self.bindings[range.range()]
     }
 
     #[must_use]

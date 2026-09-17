@@ -59,7 +59,8 @@ fn a_name_is_interned_once_and_reads_back() {
 #[test]
 fn a_term_stays_small() {
     assert_eq!(size_of::<Expr>(), 16);
-    assert_eq!(size_of::<Arm>(), 8);
+    assert_eq!(size_of::<Arm>(), 16);
+    assert_eq!(size_of::<Body>(), 12);
     assert_eq!(size_of::<Atom>(), 4);
 }
 
@@ -184,28 +185,34 @@ fn the_builder_writes_the_lets_itself() {
     });
 
     // Two parameters, `k` in the recursive arm, and the call bound inside it.
-    // Neither the constructor nor the match binds anything: each is the body
-    // of its scope, so `close` used it rather than wrapping it in a `let`.
+    // Neither the constructor nor the match binds anything: each is the tail
+    // of its body.
     assert_eq!(program.locals(add), 4);
-    let Expr::Match(scrutinee, arms) = program.expr(program.function(add).body) else {
-        panic!("the body is the match itself, with no `let` around it");
+
+    let body = program.function(add).body;
+    assert!(
+        program.bindings(body.bindings).is_empty(),
+        "the match is the tail, with nothing bound before it"
+    );
+    let Expr::Match(scrutinee, arms) = program.expr(body.tail) else {
+        panic!("the body answers with the match itself");
     };
     assert_eq!(scrutinee, Atom(Local(1)), "the second parameter");
     let arms = program.arms(arms).to_vec();
     assert_eq!(arms.len(), 2, "one arm per constructor, by construction");
     assert_eq!(
-        program.expr(arms[0].body),
+        program.expr(arms[0].body.tail),
         Expr::Atom(Atom(Local(0))),
         "Zero answers the left operand"
     );
-    let Expr::Let(call, tail) = program.expr(arms[1].body) else {
-        panic!("the recursive arm binds its call");
+
+    // The recursive arm binds its call and answers the constructor.
+    let recursive = arms[1].body;
+    let [call] = program.bindings(recursive.bindings) else {
+        panic!("one binding, for the call");
     };
-    assert!(matches!(program.expr(call), Expr::Call(..)));
-    assert!(
-        matches!(program.expr(tail), Expr::Con(..)),
-        "no trailing atom"
-    );
+    assert!(matches!(program.expr(*call), Expr::Call(..)));
+    assert!(matches!(program.expr(recursive.tail), Expr::Con(..)));
 }
 
 /// `2 + 2`, with `Nat` as the inductive type it is: addition recurses on its
@@ -250,12 +257,12 @@ add(v0: Nat, v1: Nat) -> Nat =
     Zero =>
       v0
     Succ(v2) =>
-      let v3 = add(v0, v2)
+      v3 = add(v0, v2)
       Succ(v3)
   }
 
 main() -> Nat =
-  let v0 = 2
+  v0 = 2
   add(v0, v0)
 "
     );

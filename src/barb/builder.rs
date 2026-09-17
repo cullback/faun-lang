@@ -7,7 +7,7 @@
 
 use super::constant;
 use super::ir::Symbol;
-use super::ir::{Arm, Atom, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local};
+use super::ir::{Arm, Atom, Body, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local};
 use super::ir::{Program, Range, Type, TypeId};
 use constant::{Shape, Value};
 
@@ -79,7 +79,11 @@ impl Program {
             name,
             params: Range::of(at, params.len()),
             result,
-            body: ExprId(0),
+            // Replaced by `define`; a declared function has no body yet.
+            body: Body {
+                bindings: Range::default(),
+                tail: ExprId(0),
+            },
         });
         FnId::at(self.functions.len() - 1)
     }
@@ -244,7 +248,7 @@ impl Builder<'_> {
     }
 
     /// Build a nested scope that first binds `bound` locals of its own.
-    fn scope(&mut self, bound: u32, build: impl FnOnce(&mut Self, &[Atom]) -> Atom) -> ExprId {
+    fn scope(&mut self, bound: u32, build: impl FnOnce(&mut Self, &[Atom]) -> Atom) -> Body {
         let outer = std::mem::take(&mut self.pending);
         let level = self.level;
         let binders: Vec<Atom> = (0..bound).map(|at| Atom(Local(level + at))).collect();
@@ -258,13 +262,13 @@ impl Builder<'_> {
         body
     }
 
-    /// Fold this scope's bindings around its result. A result that is the
-    /// last binding becomes the body itself rather than a `Let` into an
-    /// atom, since nothing after it could have read it.
-    fn close(&mut self, result: Atom) -> ExprId {
+    /// This scope's bindings, with its result as the tail. A result that is
+    /// the last binding becomes the tail itself rather than a binding an
+    /// atom then reads back, since nothing after it could have read it.
+    fn close(&mut self, result: Atom) -> Body {
         let mut pending = std::mem::take(&mut self.pending);
         let last = self.level.checked_sub(1).map(Local);
-        let mut body = match pending.pop() {
+        let tail = match pending.pop() {
             Some(expr) if last == Some(result.0) => expr,
             Some(expr) => {
                 pending.push(expr);
@@ -272,10 +276,12 @@ impl Builder<'_> {
             }
             None => self.push(Expr::Atom(result)),
         };
-        for expr in pending.into_iter().rev() {
-            body = self.push(Expr::Let(expr, body));
+        let at = self.program.bindings.len();
+        self.program.bindings.extend_from_slice(&pending);
+        Body {
+            bindings: Range::of(at, pending.len()),
+            tail,
         }
-        body
     }
 
     fn push(&mut self, expr: Expr) -> ExprId {

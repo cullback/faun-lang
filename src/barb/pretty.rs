@@ -3,7 +3,7 @@
 use std::fmt::Write;
 
 use super::constant::{Shape, as_bytes, as_number, shape};
-use super::ir::{Expr, FnId, Program, Symbol, TypeId};
+use super::ir::{Body, Expr, FnId, Program, Symbol, TypeId};
 
 impl Program {
     /// The whole program: its types, then its functions.
@@ -61,7 +61,27 @@ impl Program {
             self.name(self.type_(function.result).name)
         );
         let level = u32::try_from(self.params(id).len()).expect("a sane arity");
-        self.render_expr(function.body, level, 1, out);
+        self.render_body(function.body, level, 1, out);
+    }
+
+    /// Each binding on its own line, then what the body answers.
+    fn render_body(&self, body: Body, level: u32, depth: usize, out: &mut String) {
+        let pad = "  ".repeat(depth);
+        let mut level = level;
+        for binding in self.bindings(body.bindings).to_vec() {
+            let mut bound = String::new();
+            self.render_expr(binding, level, depth, &mut bound);
+            // A match bound to a name runs over several lines; the rest keep
+            // the indentation they were rendered with.
+            let text = bound.trim_end();
+            let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+            let _ = writeln!(out, "{pad}v{level} = {}", first.trim_start());
+            if !rest.is_empty() {
+                let _ = writeln!(out, "{rest}");
+            }
+            level += 1;
+        }
+        self.render_expr(body.tail, level, depth, out);
     }
 
     fn render_expr(&self, expr: super::ir::ExprId, level: u32, depth: usize, out: &mut String) {
@@ -80,12 +100,6 @@ impl Program {
             Expr::Static(id, value) => {
                 let _ = writeln!(out, "{pad}{}", self.render_known(id, value));
             }
-            Expr::Let(value, body) => {
-                let mut bound = String::new();
-                self.render_expr(value, level, 0, &mut bound);
-                let _ = writeln!(out, "{pad}let v{level} = {}", bound.trim());
-                self.render_expr(body, level + 1, depth, out);
-            }
             Expr::Match(scrutinee, arms) => {
                 let _ = writeln!(out, "{pad}match v{} {{", scrutinee.0.0);
                 for arm in self.arms(arms).to_vec() {
@@ -100,7 +114,7 @@ impl Program {
                         writeln!(out, "{pad}  {name}({}) =>", bound.join(", "))
                     };
                     let inner = level + u32::try_from(fields).expect("a sane arity");
-                    self.render_expr(arm.body, inner, depth + 2, out);
+                    self.render_body(arm.body, inner, depth + 2, out);
                 }
                 let _ = writeln!(out, "{pad}}}");
             }
