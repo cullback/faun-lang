@@ -31,6 +31,7 @@
 //!   `mmap` and the stack from the kernel, so neither needs a segment.
 
 use super::Code;
+use crate::ir::Program;
 use crate::targets::bytes::{Bytes, len32};
 
 pub(super) const EHDR_LEN: u16 = 64;
@@ -48,53 +49,44 @@ struct Segment {
     len: u32,
 }
 
-pub(super) fn image(code: &Code, data: &[Vec<u8>]) -> Vec<u8> {
-    let layout = Layout::new(code, data);
+pub(super) fn image(code: &Code, program: &Program) -> Vec<u8> {
+    let layout = Layout::new(code, program);
     let mut out = Bytes::default();
 
     header(&mut out, &layout);
     for segment in &layout.segments {
         program_header(&mut out, segment);
     }
-    out.bytes(&relocated(code, &layout));
-    out.bytes(&layout.blob);
+    out.bytes(&relocated(code, &layout, program));
+    out.bytes(program.data());
 
     out.finish()
 }
 
 struct Layout {
-    /// File offset of the code, and of each datum.
+    /// File offset of the code, and of the data that follows it.
     text: usize,
-    data: Vec<usize>,
-    blob: Vec<u8>,
+    data: usize,
     segments: Vec<Segment>,
 }
 
 impl Layout {
-    fn new(code: &Code, data: &[Vec<u8>]) -> Self {
+    fn new(code: &Code, program: &Program) -> Self {
         // One mapping covers the file, its own headers included.
         let count = 1;
         let text = usize::from(EHDR_LEN) + usize::from(PHDR_LEN) * count;
+        let data = text + code.bytes.len();
 
-        let mut offsets = Vec::with_capacity(data.len());
-        let mut blob = Vec::new();
-        for bytes in data {
-            offsets.push(text + code.bytes.len() + blob.len());
-            blob.extend_from_slice(bytes);
-        }
-
-        let total = text + code.bytes.len() + blob.len();
         let segments = vec![Segment {
             flags: READ | EXECUTE,
             start: 0,
-            len: len32(total),
+            len: len32(data + program.data().len()),
         }];
         debug_assert_eq!(segments.len(), count);
 
         Self {
             text,
-            data: offsets,
-            blob,
+            data,
             segments,
         }
     }
@@ -102,11 +94,12 @@ impl Layout {
 
 /// Each address as a displacement from the end of its own instruction, which
 /// is why nothing here needs a load address.
-fn relocated(code: &Code, layout: &Layout) -> Vec<u8> {
+fn relocated(code: &Code, layout: &Layout, program: &Program) -> Vec<u8> {
     let mut text = code.bytes.clone();
     for reloc in &code.relocs {
         let from = layout.text + reloc.offset + 4;
-        let to = layout.data[reloc.data.0];
+        let start = usize::try_from(program.datum(reloc.data).0).expect("an offset in the image");
+        let to = layout.data + start;
         let displacement = to.abs_diff(from);
         let displacement = i32::try_from(displacement).expect("data within 2 GiB of the code");
         let displacement = if to < from {

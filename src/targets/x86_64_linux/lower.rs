@@ -9,12 +9,16 @@
 use super::encode::{Encoder, Reg};
 use super::{Code, Reloc};
 use crate::ir::{
-    Binary, DataId, Instruction, Op, PlatformId, Program, Region, Relation, Terminator, ValueId,
+    Binary, DataId, Function, FunctionId, Instruction, Op, PlatformId, Program, Region, Relation,
+    Terminator, ValueId,
 };
 
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 60;
 const STDOUT: u64 = 1;
+
+/// System V, so that adding C interop later changes nothing here.
+const ARG_REGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
 
 /// Condition codes, as the low nibble of a `jcc` or `setcc`.
 const EQUAL: u8 = 0x4;
@@ -25,7 +29,6 @@ const CLOBBERED: [Reg; 3] = [Reg::Rax, Reg::Rcx, Reg::R11];
 
 const TRACKED: [Reg; 6] = [Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi, Reg::Rdi, Reg::R11];
 
-/// Where a value comes from when something needs it.
 #[derive(Clone, Copy)]
 enum Source {
     Const(u64),
@@ -34,41 +37,58 @@ enum Source {
 }
 
 pub(super) fn lower(program: &Program) -> Code {
-    let plan = Plan::new(program);
+    let entry = program.entry();
     let mut state = Lowering {
         program,
-        plan,
+        entry,
+        in_entry: true,
+        plan: Plan::empty(program),
         asm: Encoder::default(),
         relocs: Vec::new(),
+        calls: Vec::new(),
+        starts: vec![0; program.functions().len()],
         known: [None; 16],
         ifs: Vec::new(),
         loops: Vec::new(),
     };
 
-    if state.plan.frame > 0 {
-        state.asm.open_frame(state.plan.frame);
+    // The entry goes first, so the image starts where the kernel jumps.
+    let rest = (0..program.functions().len())
+        .map(FunctionId)
+        .filter(|id| id.0 != entry.0);
+    for id in std::iter::once(entry).chain(rest) {
+        state.function(id);
     }
-    state.region(program.body());
+    for (hole, id) in std::mem::take(&mut state.calls) {
+        let target = state.starts[id.0];
+        state.asm.patch(hole, target);
+    }
+
     state.finish()
 }
 
-/// Which values need a stack slot, and how big the frame has to be.
 struct Plan {
     source: Vec<Source>,
-    /// Where the scratch a transfer passes through begins.
     scratch: u32,
     frame: u32,
 }
 
 impl Plan {
-    fn new(program: &Program) -> Self {
-        let mut plan = Self {
+    fn empty(program: &Program) -> Self {
+        Self {
             source: vec![Source::Slot(0); program.values()],
             scratch: 0,
             frame: 0,
-        };
-        let mut widest = 0;
-        plan.walk(program.body(), &mut widest);
+        }
+    }
+
+    /// Slots restart at every function, since a value never leaves the one
+    /// that defined it. The body's region parameters are the function's, so
+    /// walking the body gives them slots too.
+    fn new(program: &Program, function: &Function) -> Self {
+        let mut plan = Self::empty(program);
+        let mut widest = function.params.len();
+        plan.walk(&function.body, &mut widest);
         plan.scratch = plan.frame;
         plan.frame += 8 * u32::try_from(widest).expect("a sane region width");
         plan
@@ -105,7 +125,7 @@ impl Plan {
                 _ => {}
             }
         }
-        *widest = (*widest).max(carried(&region.terminator).len());
+        *widest = (*widest).max(transferred(&region.terminator).len());
     }
 
     fn give_slot(&mut self, value: ValueId) {
@@ -114,14 +134,15 @@ impl Plan {
     }
 }
 
-/// The values a terminator hands to whatever it leaves for.
-fn carried(terminator: &Terminator) -> &[ValueId] {
+/// The values a terminator moves through scratch. `Return` is not among
+/// them: it reads straight into the register it leaves by, so counting it
+/// would buy a frame that nothing writes to.
+fn transferred(terminator: &Terminator) -> &[ValueId] {
     match terminator {
-        Terminator::Yield(values)
-        | Terminator::Continue(values)
-        | Terminator::Break(values)
-        | Terminator::Return(values) => values,
-        Terminator::Unreachable => &[],
+        Terminator::Yield(values) | Terminator::Continue(values) | Terminator::Break(values) => {
+            values
+        }
+        Terminator::Return(_) | Terminator::Unreachable => &[],
     }
 }
 
@@ -139,9 +160,14 @@ struct LoopFrame {
 
 struct Lowering<'a> {
     program: &'a Program,
+    entry: FunctionId,
+    in_entry: bool,
     plan: Plan,
     asm: Encoder,
     relocs: Vec<Reloc>,
+    /// Each call, and the function it is waiting to be aimed at.
+    calls: Vec<(usize, FunctionId)>,
+    starts: Vec<usize>,
     /// The constant each register is known to hold. `None` is unknown, which
     /// is not the same as zero.
     known: [Option<u64>; 16],
@@ -155,6 +181,22 @@ impl Lowering<'_> {
             bytes: self.asm.finish(),
             relocs: self.relocs,
         }
+    }
+
+    fn function(&mut self, id: FunctionId) {
+        let function = &self.program.functions()[id.0];
+        self.in_entry = id.0 == self.entry.0;
+        self.starts[id.0] = self.asm.here();
+        self.plan = Plan::new(self.program, function);
+        self.forget();
+
+        if self.plan.frame > 0 {
+            self.asm.open_frame(self.plan.frame);
+        }
+        for (&param, reg) in function.params.iter().zip(ARG_REGS) {
+            self.store(param, reg);
+        }
+        self.region(&function.body);
     }
 
     fn region(&mut self, region: &Region) {
@@ -181,17 +223,20 @@ impl Lowering<'_> {
                 relation,
                 left,
                 right,
-            } => {
-                let cc = match relation {
-                    Relation::Equal => EQUAL,
-                    Relation::Less => BELOW,
-                };
-                self.pair(*left, *right);
-                self.asm.alu(0x39, Reg::Rax, Reg::Rcx);
-                self.asm.set_if(cc, Reg::Rax);
-                self.keep(inst.results[0]);
-            }
+            } => self.compare(*relation, *left, *right, inst.results[0]),
             Op::PlatformCall { platform, args } => self.platform_call(*platform, args),
+            Op::Call { function, args } => {
+                for (&arg, reg) in args.iter().zip(ARG_REGS) {
+                    self.read(reg, arg);
+                }
+                let hole = self.asm.call();
+                self.calls.push((hole, *function));
+                // Every register this tracks is caller-saved.
+                self.forget();
+                if let Some(&result) = inst.results.first() {
+                    self.keep(result);
+                }
+            }
             Op::If {
                 condition,
                 then_region,
@@ -199,6 +244,18 @@ impl Lowering<'_> {
             } => self.conditional(*condition, then_region, else_region, &inst.results),
             Op::Loop { initial, body } => self.repeat(initial, body, &inst.results),
         }
+    }
+
+    /// The flags the comparison set, widened back into a word.
+    fn compare(&mut self, relation: Relation, left: ValueId, right: ValueId, result: ValueId) {
+        let cc = match relation {
+            Relation::Equal => EQUAL,
+            Relation::Less => BELOW,
+        };
+        self.pair(left, right);
+        self.asm.alu(0x39, Reg::Rax, Reg::Rcx);
+        self.asm.set_if(cc, Reg::Rax);
+        self.keep(result);
     }
 
     fn platform_call(&mut self, platform: PlatformId, args: &[ValueId]) {
@@ -292,14 +349,31 @@ impl Lowering<'_> {
                 let hole = self.asm.jump();
                 self.loops.last_mut().expect("a loop").ends.push(hole);
             }
-            // Nothing calls into this program, so leaving it is exiting.
-            Terminator::Return(_) => {
-                self.load_const(Reg::Rax, SYS_EXIT);
-                self.load_const(Reg::Rdi, 0);
-                self.syscall();
-            }
-            Terminator::Unreachable => {}
+            Terminator::Return(values) => self.leave(values),
+            // Emitting nothing would fall into whatever was laid out next.
+            Terminator::Unreachable => self.asm.trap(),
         }
+    }
+
+    /// Nothing calls the entry, so leaving it is exiting.
+    fn leave(&mut self, values: &[ValueId]) {
+        if self.in_entry {
+            self.load_const(Reg::Rax, SYS_EXIT);
+            match values.first() {
+                Some(&status) => self.read(Reg::Rdi, status),
+                None => self.load_const(Reg::Rdi, 0),
+            }
+            self.syscall();
+            return;
+        }
+
+        if let Some(&value) = values.first() {
+            self.read(Reg::Rax, value);
+        }
+        if self.plan.frame > 0 {
+            self.asm.close_frame(self.plan.frame);
+        }
+        self.asm.ret();
     }
 
     /// Hand `sources` over as `destinations`, through scratch so that a swap
@@ -323,8 +397,7 @@ impl Lowering<'_> {
         self.plan.scratch + 8 * u32::try_from(index).expect("a sane region width")
     }
 
-    /// Put `left` in rax and `right` in rcx, which is what every two-operand
-    /// form here works on.
+    /// rax and rcx, which is what every two-operand form here works on.
     fn pair(&mut self, left: ValueId, right: ValueId) {
         self.read(Reg::Rax, left);
         self.read(Reg::Rcx, right);
@@ -332,11 +405,15 @@ impl Lowering<'_> {
 
     /// Write rax to wherever `value` lives.
     fn keep(&mut self, value: ValueId) {
+        self.store(value, Reg::Rax);
+    }
+
+    fn store(&mut self, value: ValueId, from: Reg) {
         let Source::Slot(offset) = self.plan.source[value.0] else {
             panic!("a computed value needs a slot");
         };
-        self.asm.store_slot(Reg::Rax, offset);
-        self.known[Reg::Rax.index()] = None;
+        self.asm.store_slot(from, offset);
+        self.known[from.index()] = None;
     }
 
     fn read(&mut self, dst: Reg, value: ValueId) {
@@ -405,6 +482,12 @@ mod tests {
     use super::*;
     use crate::ir::Class;
 
+    fn entry(build: impl FnOnce(&mut crate::ir::Builder) -> Terminator) -> Program {
+        let (mut program, main) = Program::new("main");
+        program.define(main, |b, _| build(b));
+        program
+    }
+
     #[test]
     fn hello_world_uses_the_short_encodings() {
         let code = lower(&crate::hello_world());
@@ -432,13 +515,14 @@ mod tests {
     /// hello world at the size it is.
     #[test]
     fn constants_never_reach_the_stack() {
-        assert_eq!(Plan::new(&crate::hello_world()).frame, 0);
+        let program = crate::hello_world();
+        let main = &program.functions()[program.entry().0];
+        assert_eq!(Plan::new(&program, main).frame, 0);
     }
 
     #[test]
     fn a_loop_jumps_backwards_to_its_own_head() {
-        let mut program = Program::new();
-        program.build(|b| {
+        let program = entry(|b| {
             let start = b.constant(Class::Word, 1);
             b.loop_(vec![start], Vec::new(), |b, params| {
                 let one = b.constant(Class::Word, 1);
@@ -449,29 +533,28 @@ mod tests {
         });
 
         let bytes = lower(&program).bytes;
-        // The last five bytes are `jmp rel32` back to the loop head, which is
-        // behind us, so the displacement is negative.
-        let (jump, displacement) = bytes.split_at(bytes.len() - 4);
-        assert_eq!(jump.last(), Some(&0xE9));
-        let displacement = i32::from_le_bytes(displacement.try_into().unwrap());
+        // `ud2` for the unreachable tail, and before it a `jmp rel32` back to
+        // the loop head, which is behind us, so the displacement is negative.
+        let end = bytes.len() - 2;
+        assert_eq!(&bytes[end..], [0x0F, 0x0B]);
+        assert_eq!(bytes[end - 5], 0xE9);
+        let displacement = i32::from_le_bytes(bytes[end - 4..end].try_into().unwrap());
         assert!(displacement < 0, "a loop must branch backwards");
     }
 
     #[test]
     fn a_syscall_invalidates_the_registers_it_clobbers() {
-        let mut program = Program::new();
+        let (mut program, main) = Program::new("main");
         let data = program.intern(b"x".as_slice());
         let write = program.platform("write", vec![Class::Address, Class::Word], Vec::new());
-        let exit = program.platform("exit", vec![Class::Word], Vec::new());
-        program.build(|b| {
+        program.define(main, |b, _| {
             let buf = b.address_of(data);
             let len = b.constant(Class::Word, 1);
-            b.call(write, vec![buf, len]);
-            // Exit with the status stdout had, so the two registers that both
-            // held 1 across the syscall can be told apart.
+            b.platform_call(write, vec![buf, len]);
+            // Leave with the status stdout had, so the two registers that
+            // both held 1 across the syscall can be told apart.
             let status = b.constant(Class::Word, 1);
-            b.call(exit, vec![status]);
-            Terminator::Unreachable
+            Terminator::Return(vec![status])
         });
 
         let bytes = lower(&program).bytes;

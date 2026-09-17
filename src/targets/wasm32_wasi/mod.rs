@@ -24,10 +24,8 @@ pub fn emit(program: &Program) -> Vec<Artifact> {
 }
 
 struct Code {
-    /// Instructions, without the local declarations or the trailing `end`.
-    body: Vec<u8>,
-    /// How many `i32` locals `_start` declares.
-    locals: u32,
+    bodies: Vec<Body>,
+    entry: usize,
     data: Vec<Segment>,
     /// The WASI functions this module calls, in index order. A module that
     /// calls none imports none, and declares no memory for them to read.
@@ -38,4 +36,12 @@ struct Code {
 struct Segment {
     offset: u32,
     bytes: Vec<u8>,
+}
+
+/// Instructions without the local declarations or the trailing `end`.
+struct Body {
+    params: u32,
+    locals: u32,
+    returns: u32,
+    code: Vec<u8>,
 }

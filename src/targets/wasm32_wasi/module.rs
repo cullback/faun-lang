@@ -20,16 +20,16 @@ const WASI: &str = "wasi_snapshot_preview1";
 const PAGE_SIZE: u32 = 65536;
 
 pub(super) fn module(code: &Code) -> Vec<u8> {
-    // Imports come first in both index spaces, so their count is also the
-    // index of the one function this compiler writes, and of its type.
-    let start = len32(code.imports.len());
+    // Imports come first in the function index space, so every body is
+    // numbered after them.
+    let imports = len32(code.imports.len());
     let mut out = Bytes::default();
     out.bytes(b"\0asm");
     out.bytes(&[1, 0, 0, 0]);
 
-    types(&mut out, &code.imports);
+    types(&mut out, code);
     out.section(IMPORT, |s| {
-        s.uleb(start);
+        s.uleb(imports);
         for (index, name) in code.imports.iter().enumerate() {
             s.name(WASI);
             s.name(name);
@@ -38,8 +38,10 @@ pub(super) fn module(code: &Code) -> Vec<u8> {
         }
     });
     out.section(FUNCTION, |s| {
-        s.uleb(1);
-        s.uleb(start);
+        s.uleb(len32(code.bodies.len()));
+        for index in 0..code.bodies.len() {
+            s.uleb(imports + len32(index));
+        }
     });
     if code.memory {
         out.section(MEMORY, |s| {
@@ -48,58 +50,64 @@ pub(super) fn module(code: &Code) -> Vec<u8> {
             s.uleb(pages(code));
         });
     }
-    exports(&mut out, code.memory, start);
-    body(&mut out, code);
+    exports(&mut out, code, imports);
+    bodies(&mut out, code);
     data(&mut out, code);
 
     out.finish()
 }
 
-/// One signature per imported function, then `_start`.
-fn types(out: &mut Bytes, imports: &[&str]) {
+/// One signature per import, then one per function. Types are not shared
+/// between functions of the same shape; nothing yet has enough of them for
+/// the table to be worth deduplicating.
+fn types(out: &mut Bytes, code: &Code) {
     out.section(TYPE, |s| {
-        s.uleb(len32(imports.len()) + 1);
-        for name in imports {
+        s.uleb(len32(code.imports.len() + code.bodies.len()));
+        for name in &code.imports {
             let (params, returns) = match *name {
-                "fd_write" => (4, true),   // (fd, iovs, iovs_len, nwritten)
-                "proc_exit" => (1, false), // (status)
+                "fd_write" => (4, 1),  // (fd, iovs, iovs_len, nwritten)
+                "proc_exit" => (1, 0), // (status)
                 other => panic!("no signature for `{other}`"),
             };
             signature(s, params, returns);
         }
-        signature(s, 0, false); // _start()
+        for body in &code.bodies {
+            signature(s, body.params, body.returns);
+        }
     });
 }
 
 /// WASI finds these by name. Memory is only exported when something reads
 /// it, which for a program that prints nothing is never.
-fn exports(out: &mut Bytes, memory: bool, start: u32) {
+fn exports(out: &mut Bytes, code: &Code, imports: u32) {
     out.section(EXPORT, |s| {
-        s.uleb(1 + u32::from(memory));
-        if memory {
+        s.uleb(1 + u32::from(code.memory));
+        if code.memory {
             s.name("memory");
             s.byte(KIND_MEMORY);
             s.uleb(0);
         }
         s.name("_start");
         s.byte(KIND_FUNC);
-        s.uleb(start);
+        s.uleb(imports + len32(code.entry));
     });
 }
 
-/// One function: its locals, the instructions, and the terminating `end`.
-fn body(out: &mut Bytes, code: &Code) {
+/// Each function: its locals, its instructions, and the terminating `end`.
+fn bodies(out: &mut Bytes, code: &Code) {
     out.section(CODE, |s| {
-        s.uleb(1);
-        s.sized(|f| {
-            f.uleb(u32::from(code.locals > 0));
-            if code.locals > 0 {
-                f.uleb(code.locals);
-                f.byte(I32);
-            }
-            f.bytes(&code.body);
-            f.byte(END);
-        });
+        s.uleb(len32(code.bodies.len()));
+        for body in &code.bodies {
+            s.sized(|f| {
+                f.uleb(u32::from(body.locals > 0));
+                if body.locals > 0 {
+                    f.uleb(body.locals);
+                    f.byte(I32);
+                }
+                f.bytes(&body.code);
+                f.byte(END);
+            });
+        }
     });
 }
 
@@ -121,14 +129,15 @@ fn data(out: &mut Bytes, code: &Code) {
     });
 }
 
-fn signature(out: &mut Bytes, params: usize, returns_i32: bool) {
+fn signature(out: &mut Bytes, params: u32, returns: u32) {
     out.byte(FUNC_TYPE);
-    out.uleb(len32(params));
-    out.bytes(&vec![I32; params]);
-    out.uleb(u32::from(returns_i32));
-    if returns_i32 {
-        out.byte(I32);
-    }
+    out.uleb(params);
+    out.bytes(&vec![
+        I32;
+        usize::try_from(params).expect("a few parameters")
+    ]);
+    out.uleb(returns);
+    out.bytes(&vec![I32; usize::try_from(returns).expect("a few results")]);
 }
 
 fn pages(code: &Code) -> u32 {

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 
+use faun::ir::Class::Word;
 use faun::ir::{Binary, Class, Program, Relation, Terminator};
 use faun::targets::Target;
 
@@ -38,7 +39,34 @@ fn the_smallest_wasm32_wasi_module_imports_nothing() {
     let (output, bytes) = run(Target::Wasm32Wasi, &empty());
     assert_eq!(output, "");
     // Type, function, export, code. No imports, no memory, no data.
-    assert_eq!(bytes, 40);
+    assert_eq!(bytes, 39);
+}
+
+/// A call and a return, on each target's own calling convention.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn the_x86_64_linux_executable_calls_a_function() {
+    assert_eq!(status(Target::X86_64Linux, &calls_a_function()), 42);
+    assert_eq!(status(Target::X86_64Linux, &recurses()), 6);
+}
+
+#[test]
+fn the_wasm32_wasi_module_calls_a_function() {
+    assert_eq!(status(Target::Wasm32Wasi, &calls_a_function()), 42);
+    assert_eq!(status(Target::Wasm32Wasi, &recurses()), 6);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn the_x86_64_linux_executable_compares() {
+    assert_eq!(status(Target::X86_64Linux, &less(7, 9)), 1);
+    assert_eq!(status(Target::X86_64Linux, &less(9, 7)), 0);
+}
+
+#[test]
+fn the_wasm32_wasi_module_compares() {
+    assert_eq!(status(Target::Wasm32Wasi, &less(7, 9)), 1);
+    assert_eq!(status(Target::Wasm32Wasi, &less(9, 7)), 0);
 }
 
 /// The IR's loop has to survive into both targets, which have nothing in
@@ -61,24 +89,89 @@ fn the_wasm32_wasi_module_counts_down() {
 
 /// Nothing at all. A target's floor: headers, and whatever it takes to stop.
 fn empty() -> Program {
-    let mut program = Program::new();
-    program.build(|_| Terminator::Return(Vec::new()));
+    let (mut program, main) = Program::new("main");
+    program.define(main, |b, _| {
+        let status = b.constant(Word, 0);
+        Terminator::Return(vec![status])
+    });
+    program
+}
+
+/// `main` calls `double(21)` and exits with it. The point is the call, so
+/// the answer is the exit status rather than anything printed.
+fn calls_a_function() -> Program {
+    let (mut program, main) = Program::new("main");
+    let double = program.declare("double", vec![Word], vec![Word]);
+    program.define(double, |b, params| {
+        let n = params[0];
+        Terminator::Return(vec![b.binary(Binary::Add, n, n)])
+    });
+
+    program.define(main, |b, _| {
+        let twenty_one = b.constant(Word, 21);
+        let answer = b.call(double, vec![twenty_one]);
+        Terminator::Return(answer)
+    });
+    program
+}
+
+/// `sum(n)` recurses, so the call graph has a cycle and the callee needs a
+/// frame that survives its own recursive call. 1 + 2 + 3 = 6.
+fn recurses() -> Program {
+    let (mut program, main) = Program::new("main");
+    let sum = program.declare("sum", vec![Word], vec![Word]);
+    program.define(sum, |b, params| {
+        let n = params[0];
+        let zero = b.constant(Word, 0);
+        let done = b.compare(Relation::Equal, n, zero);
+        let answer = b.if_(
+            done,
+            vec![Word],
+            |b| {
+                let zero = b.constant(Word, 0);
+                Terminator::Yield(vec![zero])
+            },
+            |b| {
+                let one = b.constant(Word, 1);
+                let less = b.binary(Binary::Sub, n, one);
+                let rest = b.call(sum, vec![less]);
+                Terminator::Yield(vec![b.binary(Binary::Add, n, rest[0])])
+            },
+        );
+        Terminator::Return(answer)
+    });
+
+    program.define(main, |b, _| {
+        let three = b.constant(Word, 3);
+        Terminator::Return(b.call(sum, vec![three]))
+    });
+    program
+}
+
+/// `Relation::Less` is unsigned, and both targets carry an arm for it that
+/// nothing else exercises.
+fn less(left: u64, right: u64) -> Program {
+    let (mut program, main) = Program::new("main");
+    program.define(main, |b, _| {
+        let left = b.constant(Word, left);
+        let right = b.constant(Word, right);
+        Terminator::Return(vec![b.compare(Relation::Less, left, right)])
+    });
     program
 }
 
 /// `while n != 0 { print "tick"; n -= 1 }`, written the way the IR has it:
 /// a loop carrying `n`, and an `if` that either breaks or goes round again.
 fn countdown(times: u64) -> Program {
-    let mut program = Program::new();
+    let (mut program, main) = Program::new("main");
     let tick = program.intern(b"tick\n".as_slice());
-    let write = program.platform("write", vec![Class::Address, Class::Word], Vec::new());
-    let exit = program.platform("exit", vec![Class::Word], Vec::new());
+    let write = program.platform("write", vec![Class::Address, Word], Vec::new());
 
-    program.build(|b| {
-        let start = b.constant(Class::Word, times);
+    program.define(main, |b, _| {
+        let start = b.constant(Word, times);
         b.loop_(vec![start], Vec::new(), |b, params| {
             let n = params[0];
-            let zero = b.constant(Class::Word, 0);
+            let zero = b.constant(Word, 0);
             let done = b.compare(Relation::Equal, n, zero);
             b.if_(
                 done,
@@ -86,9 +179,9 @@ fn countdown(times: u64) -> Program {
                 |_| Terminator::Break(Vec::new()),
                 |b| {
                     let buf = b.address_of(tick);
-                    let len = b.constant(Class::Word, 5);
-                    b.call(write, vec![buf, len]);
-                    let one = b.constant(Class::Word, 1);
+                    let len = b.constant(Word, 5);
+                    b.platform_call(write, vec![buf, len]);
+                    let one = b.constant(Word, 1);
                     let next = b.binary(Binary::Sub, n, one);
                     Terminator::Continue(vec![next])
                 },
@@ -96,12 +189,16 @@ fn countdown(times: u64) -> Program {
             Terminator::Unreachable
         });
 
-        let status = b.constant(Class::Word, 0);
-        b.call(exit, vec![status]);
-        Terminator::Unreachable
+        let status = b.constant(Word, 0);
+        Terminator::Return(vec![status])
     });
 
     program
+}
+
+/// The exit status a program leaves with, which is what `main` returns.
+fn status(target: Target, program: &Program) -> i32 {
+    execute(target, program).0
 }
 
 /// Compile, write, execute. Returns what the program printed and how big it
@@ -111,6 +208,12 @@ fn countdown(times: u64) -> Program {
 /// `Command` inherits this one's still-open write descriptor, and the exec
 /// that follows fails with `ETXTBSY`.
 fn run(target: Target, program: &Program) -> (String, usize) {
+    let (code, output, size) = execute(target, program);
+    assert_eq!(code, 0, "exited with {code}");
+    (output, size)
+}
+
+fn execute(target: Target, program: &Program) -> (i32, String, usize) {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -133,8 +236,8 @@ fn run(target: Target, program: &Program) -> (String, usize) {
     let size = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
     fs::remove_dir_all(&dir).unwrap();
 
-    assert!(output.status.success(), "exited with {:?}", output.status);
-    (String::from_utf8(output.stdout).unwrap(), size)
+    let code = output.status.code().expect("the program was not signalled");
+    (code, String::from_utf8(output.stdout).unwrap(), size)
 }
 
 fn write(target: Target, output: &Path, program: &Program) -> PathBuf {

@@ -13,7 +13,7 @@ use crate::targets::Artifact;
 pub fn emit(program: &Program) -> Vec<Artifact> {
     vec![Artifact {
         extension: "",
-        bytes: elf::image(&lower::lower(program), program.data()),
+        bytes: elf::image(&lower::lower(program), program),
         executable: true,
     }]
 }

@@ -9,6 +9,8 @@ pub(super) enum Reg {
     Rdx = 2,
     Rsi = 6,
     Rdi = 7,
+    R8 = 8,
+    R9 = 9,
     R11 = 11,
 }
 
@@ -94,8 +96,8 @@ impl Encoder {
         self.emit(&[0x0F, 0x05]);
     }
 
-    /// `dst = [rsp + disp]`, and its mirror. The `ModRM` `rm` of 100 means a
-    /// SIB byte follows; 0x24 is rsp as the base with no index.
+    /// A `ModRM` `rm` of 100 means a SIB byte follows; 0x24 is rsp as the
+    /// base with no index.
     pub(super) fn load_slot(&mut self, dst: Reg, disp: u32) {
         self.slot(0x8B, dst, disp);
     }
@@ -110,13 +112,12 @@ impl Encoder {
         self.emit(&disp.to_le_bytes());
     }
 
-    /// `sub rsp, bytes`, to open the frame the slots live in.
     pub(super) fn open_frame(&mut self, bytes: u32) {
         self.emit(&[0x48, 0x81, 0xEC]);
         self.emit(&bytes.to_le_bytes());
     }
 
-    /// `dst = dst op src` for the one-byte ALU forms.
+    /// `dst = dst op src`.
     pub(super) fn alu(&mut self, opcode: u8, dst: Reg, src: Reg) {
         self.rex(true, Some(src), dst);
         self.emit(&[opcode, modrm(src, dst)]);
@@ -130,18 +131,36 @@ impl Encoder {
         self.emit(&[0x0F, 0xB6, modrm(dst, dst)]);
     }
 
-    /// `dst = rip + disp`, the address of something a known distance away.
-    /// Returns the offset of the displacement, which is measured from the
-    /// end of this instruction. `REX.W` is not optional: without it the
-    /// address is truncated to 32 bits, which ASLR makes fatal.
+    /// The displacement is measured from the end of this instruction, and
+    /// its offset is returned. `REX.W` is not optional: without it the
+    /// address truncates to 32 bits, which ASLR makes fatal.
     pub(super) fn lea_rip(&mut self, dst: Reg) -> usize {
         self.rex(true, Some(dst), Reg::Rax);
         self.emit(&[0x8D, (dst.low() << 3) | 5]);
         self.hole()
     }
 
-    /// An unconditional jump, or one taken when the flags satisfy `cc`.
-    /// Both leave a hole for [`Encoder::patch`], whose offset is returned.
+    /// Leaves a hole for [`Encoder::patch`], like any other displacement.
+    pub(super) fn call(&mut self) -> usize {
+        self.emit(&[0xE8]);
+        self.hole()
+    }
+
+    pub(super) fn ret(&mut self) {
+        self.emit(&[0xC3]);
+    }
+
+    pub(super) fn trap(&mut self) {
+        self.emit(&[0x0F, 0x0B]);
+    }
+
+    pub(super) fn close_frame(&mut self, bytes: u32) {
+        self.emit(&[0x48, 0x81, 0xC4]);
+        self.emit(&bytes.to_le_bytes());
+    }
+
+    /// Unconditional, or taken when the flags satisfy `cc`. Both leave a
+    /// hole, and return its offset.
     pub(super) fn jump(&mut self) -> usize {
         self.emit(&[0xE9]);
         self.hole()
@@ -162,8 +181,8 @@ impl Encoder {
         self.bytes.len()
     }
 
-    /// Aim a jump left by [`Encoder::jump`] at `target`. Displacements count
-    /// from the end of the instruction, which is the end of the hole.
+    /// Displacements count from the end of the instruction, which is the
+    /// end of the hole.
     pub(super) fn patch(&mut self, hole: usize, target: usize) {
         let from = i64::try_from(hole + 4).expect("a reachable offset");
         let to = i64::try_from(target).expect("a reachable offset");

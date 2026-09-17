@@ -22,23 +22,21 @@ pub struct DataId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformId(pub usize);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FunctionId(pub usize);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValueId(pub usize);
 
-/// The width a value is held at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
-    /// A machine word: as wide as an address, whatever the target's is.
-    /// Lengths, counts, and tags are words.
+    /// As wide as an address, whatever the target's is.
     Word,
-    /// Exactly `bits` bits, for arithmetic whose width the program fixes.
-    Fixed { bits: u16 },
-    /// The address of a datum.
     Address,
 }
 
-/// What a program cannot compute for itself. A target provides these and
-/// nothing else.
+/// What a program cannot compute for itself. A target provides what it has
+/// and rejects the rest by name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Platform {
     pub name: String,
@@ -80,13 +78,17 @@ pub enum Op {
         platform: PlatformId,
         args: Vec<ValueId>,
     },
+    Call {
+        function: FunctionId,
+        args: Vec<ValueId>,
+    },
     If {
         condition: ValueId,
         then_region: Region,
         else_region: Region,
     },
-    /// Runs `body` with `initial`, again with whatever each `Continue`
-    /// carries, until a `Break` leaves with the results.
+    /// Runs `body` with `initial`, then with whatever each `Continue`
+    /// carries, until a `Break` leaves.
     Loop {
         initial: Vec<ValueId>,
         body: Region,
@@ -99,9 +101,6 @@ pub struct Instruction {
     pub op: Op,
 }
 
-/// A run of instructions and the way it leaves. Regions take parameters
-/// rather than joining values afterwards, so a loop is the tail call it was
-/// written as and no target has to reconstruct one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
     pub params: Vec<ValueId>,
@@ -113,22 +112,30 @@ pub struct Region {
 pub enum Terminator {
     /// Leave the enclosing `if`, giving it its results.
     Yield(Vec<ValueId>),
-    /// Go round the enclosing loop again with these.
     Continue(Vec<ValueId>),
-    /// Leave the enclosing loop, giving it its results.
     Break(Vec<ValueId>),
     Return(Vec<ValueId>),
-    /// Control cannot arrive here.
     Unreachable,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Function {
+    pub name: String,
+    pub params: Vec<ValueId>,
+    pub returns: Vec<Class>,
+    pub body: Region,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     platform: Vec<Platform>,
-    data: Vec<Vec<u8>>,
-    /// `classes[value]` is the single source of a value's class.
+    /// Every datum end to end. A target adds its own base and nothing else,
+    /// so two of them cannot disagree about the layout between.
+    data: Vec<u8>,
+    /// Each datum's start and length within `data`.
+    spans: Vec<(u32, u32)>,
+    functions: Vec<Function>,
     classes: Vec<Class>,
-    body: Region,
 }
 
 impl Default for Region {
@@ -142,14 +149,31 @@ impl Default for Region {
 }
 
 impl Program {
+    /// A program and its entry function, which takes nothing and returns one
+    /// word, the exit status. Minting it here is what makes a program without
+    /// an entry unrepresentable.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(entry: &str) -> (Self, FunctionId) {
+        let mut program = Self {
+            platform: Vec::new(),
+            data: Vec::new(),
+            spans: Vec::new(),
+            functions: Vec::new(),
+            classes: Vec::new(),
+        };
+        let entry = program.declare(entry, Vec::new(), vec![Class::Word]);
+        (program, entry)
     }
 
-    pub fn intern(&mut self, bytes: impl Into<Vec<u8>>) -> DataId {
-        self.data.push(bytes.into());
-        DataId(self.data.len() - 1)
+    /// # Panics
+    ///
+    /// If the program's data outgrows the 4 GiB a target can address.
+    pub fn intern(&mut self, bytes: &[u8]) -> DataId {
+        let start = u32::try_from(self.data.len()).expect("data within 4 GiB");
+        let length = u32::try_from(bytes.len()).expect("a datum within 4 GiB");
+        self.data.extend_from_slice(bytes);
+        self.spans.push((start, length));
+        DataId(self.spans.len() - 1)
     }
 
     pub fn platform(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> PlatformId {
@@ -161,16 +185,35 @@ impl Program {
         PlatformId(self.platform.len() - 1)
     }
 
-    /// Fill in the program's body. The builder mints values, so it holds the
-    /// program until the region is finished.
-    pub fn build(&mut self, build: impl FnOnce(&mut Builder) -> Terminator) {
-        let mut builder = Builder {
-            program: self,
-            params: Vec::new(),
-            instructions: Vec::new(),
+    /// Separate from defining, so a body may call a function declared after
+    /// it, or itself.
+    pub fn declare(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> FunctionId {
+        let params = params.into_iter().map(|class| self.fresh(class)).collect();
+        self.functions.push(Function {
+            name: name.to_owned(),
+            params,
+            returns,
+            body: Region::default(),
+        });
+        FunctionId(self.functions.len() - 1)
+    }
+
+    pub fn define(
+        &mut self,
+        function: FunctionId,
+        build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
+    ) {
+        let params = self.functions[function.0].params.clone();
+        let body = {
+            let mut builder = Builder {
+                program: self,
+                params: params.clone(),
+                instructions: Vec::new(),
+            };
+            let terminator = build(&mut builder, &params);
+            builder.finish(terminator)
         };
-        let terminator = build(&mut builder);
-        self.body = builder.finish(terminator);
+        self.functions[function.0].body = body;
     }
 
     #[must_use]
@@ -179,13 +222,24 @@ impl Program {
     }
 
     #[must_use]
-    pub fn data(&self) -> &[Vec<u8>] {
+    pub fn data(&self) -> &[u8] {
         &self.data
     }
 
     #[must_use]
-    pub const fn body(&self) -> &Region {
-        &self.body
+    pub fn datum(&self, data: DataId) -> (u32, u32) {
+        self.spans[data.0]
+    }
+
+    #[must_use]
+    pub fn functions(&self) -> &[Function] {
+        &self.functions
+    }
+
+    /// Always the first, since [`Program::new`] declares it.
+    #[must_use]
+    pub const fn entry(&self) -> FunctionId {
+        FunctionId(0)
     }
 
     #[must_use]
@@ -204,7 +258,6 @@ impl Program {
     }
 }
 
-/// Accumulates one region's instructions.
 #[derive(Debug)]
 pub struct Builder<'a> {
     program: &'a mut Program,
@@ -226,6 +279,11 @@ impl Builder<'_> {
         self.push(Op::AddressOf(data), vec![Class::Address])[0]
     }
 
+    pub fn data_len(&mut self, data: DataId) -> ValueId {
+        let (_, length) = self.program.datum(data);
+        self.constant(Class::Word, u64::from(length))
+    }
+
     pub fn binary(&mut self, op: Binary, left: ValueId, right: ValueId) -> ValueId {
         let class = self.program.class(left);
         self.push(Op::Binary { op, left, right }, vec![class])[0]
@@ -240,9 +298,14 @@ impl Builder<'_> {
         self.push(op, vec![Class::Word])[0]
     }
 
-    pub fn call(&mut self, platform: PlatformId, args: Vec<ValueId>) -> Vec<ValueId> {
+    pub fn platform_call(&mut self, platform: PlatformId, args: Vec<ValueId>) -> Vec<ValueId> {
         let returns = self.program.platform[platform.0].returns.clone();
         self.push(Op::PlatformCall { platform, args }, returns)
+    }
+
+    pub fn call(&mut self, function: FunctionId, args: Vec<ValueId>) -> Vec<ValueId> {
+        let returns = self.program.functions[function.0].returns.clone();
+        self.push(Op::Call { function, args }, returns)
     }
 
     pub fn if_(
@@ -262,8 +325,7 @@ impl Builder<'_> {
         self.push(op, results)
     }
 
-    /// The body runs with `initial`, then with whatever each `Continue`
-    /// carries. `results` are the classes a `Break` leaves with.
+    /// `results` are the classes a `Break` leaves with.
     pub fn loop_(
         &mut self,
         initial: Vec<ValueId>,

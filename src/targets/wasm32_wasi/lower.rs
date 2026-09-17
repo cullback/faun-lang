@@ -7,15 +7,16 @@
 //!   `exit 0` calls nothing and need not import `proc_exit`, which is most
 //!   of an import section.
 
-use super::{CALL, Code, DROP, END, I32_CONST, Segment};
-use crate::ir::{Binary, DataId, Instruction, Op, Program, Region, Relation, Terminator, ValueId};
+use super::{Body, CALL, Code, DROP, END, I32_CONST, Segment};
+use crate::ir::{
+    Binary, DataId, FunctionId, Instruction, Op, Program, Region, Relation, Terminator, ValueId,
+};
 use crate::targets::bytes::{Bytes, len32};
 
 const STDOUT: i32 = 1;
 
-/// Linear memory: the cell `fd_write` reports its byte count into and which
-/// nothing reads, then the vectors, four-byte aligned as WASI requires, then
-/// the data.
+/// Linear memory: the cell `fd_write` reports its byte count into, then the
+/// vectors, four-byte aligned as WASI requires, then the data.
 const NWRITTEN: i32 = 0;
 const IOVECS: u32 = 8;
 const IOVEC_LEN: u32 = 8;
@@ -44,28 +45,18 @@ enum Source {
 }
 
 pub(super) fn lower(program: &Program) -> Code {
-    let mut plan = Plan {
-        source: vec![Source::Local(0); program.values()],
-        locals: 0,
-        writes: 0,
-    };
-    plan.walk(program, program.body());
+    let (plan, frames) = Plan::new(program);
 
-    // The data sits after the vectors that will point into it.
     let data_start = IOVECS + IOVEC_LEN * len32(plan.writes);
-    let mut blob = Vec::new();
-    let mut addrs = Vec::with_capacity(program.data().len());
-    for bytes in program.data() {
-        addrs.push(data_start + len32(blob.len()));
-        blob.extend_from_slice(bytes);
-    }
 
     let writes = plan.writes > 0;
     let mut state = Lowering {
         program,
+        entry: program.entry(),
+        in_entry: true,
         iovecs: vec![None; plan.writes],
         plan,
-        addrs,
+        data_start,
         body: Bytes::default(),
         written: 0,
         depth: 0,
@@ -79,17 +70,20 @@ pub(super) fn lower(program: &Program) -> Code {
     if writes {
         state.imports.push("fd_write");
     }
-    if state.needs_proc_exit(program.body(), true) {
+    if state.needs_proc_exit() {
         state.imports.push("proc_exit");
     }
-    state.region(program.body());
+
+    let bodies = state.bodies(&frames);
 
     Code {
-        data: state.segments(data_start, blob),
-        locals: state.plan.locals,
-        memory: writes,
+        data: state.segments(data_start),
+        // WASI refuses to run a module that imports anything and exports no
+        // memory, even when nothing it imports reads one.
+        memory: !state.imports.is_empty(),
+        entry: state.entry.0,
         imports: state.imports,
-        body: state.body.finish(),
+        bodies,
     }
 }
 
@@ -100,6 +94,24 @@ struct Plan {
 }
 
 impl Plan {
+    /// The plan, and each function's local count. Locals restart per
+    /// function, and a body's region parameters are the function's, so
+    /// wasm's numbering falls out: parameters first, then the rest.
+    fn new(program: &Program) -> (Self, Vec<u32>) {
+        let mut plan = Self {
+            source: vec![Source::Local(0); program.values()],
+            locals: 0,
+            writes: 0,
+        };
+        let mut frames = Vec::new();
+        for function in program.functions() {
+            plan.locals = 0;
+            plan.walk(program, &function.body);
+            frames.push(plan.locals);
+        }
+        (plan, frames)
+    }
+
     fn walk(&mut self, program: &Program, region: &Region) {
         for &param in &region.params {
             self.give_local(param);
@@ -142,50 +154,69 @@ impl Plan {
     }
 }
 
+/// The two labels a terminator can branch to: the `loop` to go round
+/// again, the `block` around it to leave.
+struct LoopFrame {
+    params: Vec<ValueId>,
+    again: usize,
+    results: Vec<ValueId>,
+    exit: usize,
+}
+
 struct Lowering<'a> {
     program: &'a Program,
+    data_start: u32,
+    entry: FunctionId,
+    in_entry: bool,
     plan: Plan,
-    addrs: Vec<u32>,
     body: Bytes,
-    /// The constant contents of each call's vector, where they were known.
+    /// Each call's vector, where its contents were known.
     iovecs: Vec<Option<(u32, u32)>>,
     written: usize,
     /// How many labels enclose the instruction being emitted.
     depth: usize,
     ifs: Vec<Vec<ValueId>>,
-    loops: Vec<(Vec<ValueId>, usize, Vec<ValueId>, usize)>,
+    loops: Vec<LoopFrame>,
     imports: Vec<&'static str>,
 }
 
 impl Lowering<'_> {
-    /// Falling off the end of `_start` already means success, so an `exit 0`
-    /// in last position costs nothing and needs no import.
-    fn needs_proc_exit(&self, region: &Region, outermost: bool) -> bool {
-        let last = region.instructions.len().saturating_sub(1);
-        region
-            .instructions
-            .iter()
-            .enumerate()
-            .any(|(index, inst)| match &inst.op {
-                Op::PlatformCall { platform, args } => {
-                    self.program.platforms()[platform.0].name == "exit"
-                        && !(outermost && index == last && self.constant(args[0]) == Some(0))
-                }
-                Op::If {
-                    then_region,
-                    else_region,
-                    ..
-                } => {
-                    self.needs_proc_exit(then_region, false)
-                        || self.needs_proc_exit(else_region, false)
-                }
-                Op::Loop { body, .. } => self.needs_proc_exit(body, false),
-                _ => false,
-            })
+    /// Falling off the end of `_start` already means success, so an entry
+    /// returning a constant zero costs nothing and needs no import.
+    fn needs_proc_exit(&self) -> bool {
+        let entry = &self.program.functions()[self.entry.0];
+        !matches!(
+            entry.body.terminator,
+            Terminator::Return(ref values)
+                if values.first().is_none_or(|&v| self.constant(v) == Some(0))
+        )
     }
 
-    /// The vectors and the data, as regions of memory to initialise.
-    fn segments(&self, data_start: u32, blob: Vec<u8>) -> Vec<Segment> {
+    /// `_start` returns nothing of its own, whatever the entry's signature
+    /// says: WASI takes the status through `proc_exit`.
+    fn bodies(&mut self, frames: &[u32]) -> Vec<Body> {
+        let mut bodies = Vec::new();
+        for (id, function) in self.program.functions().iter().enumerate() {
+            self.in_entry = id == self.entry.0;
+            self.body = Bytes::default();
+            self.region(&function.body);
+
+            let params = len32(function.params.len());
+            bodies.push(Body {
+                params,
+                locals: frames[id] - params,
+                returns: if self.in_entry {
+                    0
+                } else {
+                    len32(function.returns.len())
+                },
+                code: std::mem::take(&mut self.body).finish(),
+            });
+        }
+        bodies
+    }
+
+    fn segments(&self, data_start: u32) -> Vec<Segment> {
         let mut vectors = Vec::new();
         for iovec in &self.iovecs {
             // A call whose arguments were not constant fills its own vector.
@@ -201,10 +232,10 @@ impl Lowering<'_> {
                 bytes: vectors,
             });
         }
-        if !blob.is_empty() {
+        if !self.program.data().is_empty() {
             data.push(Segment {
                 offset: data_start,
-                bytes: blob,
+                bytes: self.program.data().to_vec(),
             });
         }
         data
@@ -221,28 +252,34 @@ impl Lowering<'_> {
         match &inst.op {
             Op::Constant { .. } | Op::AddressOf(_) => {}
             Op::Binary { op, left, right } => {
-                self.push(*left);
-                self.push(*right);
-                self.body.byte(match op {
+                let opcode = match op {
                     Binary::Add => I32_ADD,
                     Binary::Sub => I32_SUB,
-                });
-                self.set(inst.results[0]);
+                };
+                self.binary(opcode, *left, *right, inst.results[0]);
             }
             Op::Compare {
                 relation,
                 left,
                 right,
             } => {
-                self.push(*left);
-                self.push(*right);
-                self.body.byte(match relation {
+                let opcode = match relation {
                     Relation::Equal => I32_EQ,
                     Relation::Less => I32_LT_U,
-                });
-                self.set(inst.results[0]);
+                };
+                self.binary(opcode, *left, *right, inst.results[0]);
             }
             Op::PlatformCall { platform, args } => self.platform_call(*platform, args),
+            Op::Call { function, args } => {
+                for &arg in args {
+                    self.push(arg);
+                }
+                let imports = len32(self.imports.len());
+                self.call(imports + len32(function.0));
+                for &result in inst.results.iter().rev() {
+                    self.set(result);
+                }
+            }
             Op::If {
                 condition,
                 then_region,
@@ -250,6 +287,13 @@ impl Lowering<'_> {
             } => self.conditional(*condition, then_region, else_region, &inst.results),
             Op::Loop { initial, body } => self.repeat(initial, body, &inst.results),
         }
+    }
+
+    fn binary(&mut self, opcode: u8, left: ValueId, right: ValueId, result: ValueId) {
+        self.push(left);
+        self.push(right);
+        self.body.byte(opcode);
+        self.set(result);
     }
 
     fn conditional(
@@ -284,8 +328,12 @@ impl Lowering<'_> {
         self.open();
         let again = self.depth - 1;
 
-        self.loops
-            .push((body.params.clone(), again, results.to_vec(), exit));
+        self.loops.push(LoopFrame {
+            params: body.params.clone(),
+            again,
+            results: results.to_vec(),
+            exit,
+        });
         self.region(body);
         self.loops.pop();
 
@@ -301,17 +349,32 @@ impl Lowering<'_> {
                 self.transfer(values, &results);
             }
             Terminator::Continue(values) => {
-                let (params, again, ..) = self.loops.last().expect("inside a loop").clone();
+                let frame = self.loops.last().expect("a continue inside a loop");
+                let (params, again) = (frame.params.clone(), frame.again);
                 self.transfer(values, &params);
                 self.branch(again);
             }
             Terminator::Break(values) => {
-                let (_, _, results, exit) = self.loops.last().expect("inside a loop").clone();
+                let frame = self.loops.last().expect("a break inside a loop");
+                let (results, exit) = (frame.results.clone(), frame.exit);
                 self.transfer(values, &results);
                 self.branch(exit);
             }
-            Terminator::Return(_) => self.body.byte(RETURN),
-            // Falling off the end of `_start` is how a WASI command succeeds.
+            Terminator::Return(values) => {
+                if self.in_entry {
+                    if let Some(index) = self.import("proc_exit") {
+                        for &value in values {
+                            self.push(value);
+                        }
+                        self.call(index);
+                    }
+                } else {
+                    for &value in values {
+                        self.push(value);
+                    }
+                    self.body.byte(RETURN);
+                }
+            }
             Terminator::Unreachable => {
                 if self.depth > 0 {
                     self.body.byte(UNREACHABLE);
@@ -373,7 +436,7 @@ impl Lowering<'_> {
                 self.constant_i32(narrow.cast_signed());
             }
             Source::Addr(data) => {
-                let address = self.addrs[data.0];
+                let address = self.data_start + self.program.datum(data).0;
                 self.constant_i32(address.cast_signed());
             }
             Source::Local(index) => {
@@ -404,7 +467,7 @@ impl Lowering<'_> {
             Source::Const(value) => {
                 Some(u32::try_from(value).expect("a word this target can hold"))
             }
-            Source::Addr(data) => Some(self.addrs[data.0]),
+            Source::Addr(data) => Some(self.data_start + self.program.datum(data).0),
             Source::Local(_) => None,
         }
     }
@@ -446,11 +509,17 @@ mod tests {
     use super::*;
     use crate::ir::Class;
 
+    fn entry(build: impl FnOnce(&mut crate::ir::Builder) -> Terminator) -> Program {
+        let (mut program, main) = Program::new("main");
+        program.define(main, |b, _| build(b));
+        program
+    }
+
     #[test]
     fn hello_world_needs_no_exit_call() {
         let code = lower(&crate::hello_world());
         assert_eq!(code.imports, ["fd_write"], "no proc_exit");
-        assert_eq!(code.locals, 0, "constants need no locals");
+        assert_eq!(code.bodies[0].locals, 0, "constants need no locals");
 
         #[rustfmt::skip]
         let expected: &[u8] = &[
@@ -461,7 +530,7 @@ mod tests {
             0x10, 0x00, // call 0        (fd_write)
             0x1A,       // drop
         ];
-        assert_eq!(code.body, expected);
+        assert_eq!(code.bodies[0].code, expected);
     }
 
     #[test]
@@ -475,26 +544,21 @@ mod tests {
 
     #[test]
     fn a_nonzero_status_has_to_be_called_in() {
-        let mut program = Program::new();
-        let exit = program.platform("exit", vec![Class::Word], Vec::new());
-        program.build(|b| {
+        let program = entry(|b| {
             let status = b.constant(Class::Word, 3);
-            b.call(exit, vec![status]);
-            Terminator::Unreachable
+            Terminator::Return(vec![status])
         });
-
         let code = lower(&program);
         assert_eq!(code.imports, ["proc_exit"]);
         // The only import, so `proc_exit` is function zero.
-        assert_eq!(code.body, [0x41, 0x03, 0x10, 0x00]);
+        assert_eq!(code.bodies[0].code, [0x41, 0x03, 0x10, 0x00]);
     }
 
     /// Structured control flow goes out as it came in: a `loop` inside a
     /// `block`, with `br 0` going round and `br 1` leaving.
     #[test]
     fn a_loop_is_a_loop() {
-        let mut program = Program::new();
-        program.build(|b| {
+        let program = entry(|b| {
             let start = b.constant(Class::Word, 1);
             b.loop_(vec![start], Vec::new(), |b, params| {
                 let zero = b.constant(Class::Word, 0);
@@ -514,7 +578,7 @@ mod tests {
             Terminator::Unreachable
         });
 
-        let body = lower(&program).body;
+        let body = lower(&program).bodies[0].code.clone();
         assert!(body.starts_with(&[
             0x41, 0x01, // i32.const 1
             0x21, 0x00, // local.set 0   (the loop parameter)
