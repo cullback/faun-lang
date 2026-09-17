@@ -79,30 +79,33 @@ pub(super) fn encode(program: &Program, id: TypeId, value: &Value, out: &mut Vec
             recursive,
         } => {
             // Count first, since a nested spine has no range end to stop at.
-            let mut elements = Vec::new();
+            // Walking twice beats holding the chain: it is already in hand.
+            let mut count = 0u64;
             let mut rest = value;
             while rest.0 == cons {
-                elements.push(rest);
+                count += 1;
                 rest = &rest.1[recursive];
             }
             assert_eq!(rest.0, nil, "a spine ends in its empty constructor");
-            let count = u32::try_from(elements.len()).expect("a spine within 4G");
-            leb128(u64::from(count), out);
-            for element in elements {
-                for (at, field) in element.1.iter().enumerate() {
+            leb128(count, out);
+
+            let mut rest = value;
+            while rest.0 == cons {
+                for (at, field) in rest.1.iter().enumerate() {
                     if at != recursive {
                         encode(program, program.fields(cons)[at], field, out);
                     }
                 }
+                rest = &rest.1[recursive];
             }
-            count
+            u32::try_from(count).expect("a spine within 4G")
         }
         Shape::Tagged => {
             if program.type_(id).ctors.len() > 1 {
                 leb128(u64::from(program.tag(value.0)), out);
             }
-            for (field, at) in value.1.iter().zip(program.fields(value.0).to_vec()) {
-                encode(program, at, field, out);
+            for (field, at) in value.1.iter().zip(program.fields(value.0)) {
+                encode(program, *at, field, out);
             }
             0
         }
@@ -178,8 +181,9 @@ fn decode_tagged(program: &Program, id: TypeId, bytes: &[u8]) -> (Value, usize) 
             } else {
                 program.ctor_at(id, 0)
             };
-            let mut fields = Vec::new();
-            for field in program.fields(ctor).to_vec() {
+            let mut fields = Vec::with_capacity(program.fields(ctor).len());
+            for index in 0..program.fields(ctor).len() {
+                let field = program.fields(ctor)[index];
                 let (value, took) = decode(program, field, &bytes[at..]);
                 fields.push(value);
                 at += took;

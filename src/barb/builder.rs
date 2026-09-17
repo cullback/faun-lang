@@ -224,7 +224,8 @@ impl Builder<'_> {
     ) -> Atom {
         let count =
             u32::try_from(self.program.type_(owner).ctors.len()).expect("a sane constructor count");
-        let mut arms = Vec::new();
+        let mut arms =
+            Vec::with_capacity(usize::try_from(count).expect("a count that fits a pointer"));
         for tag in 0..count {
             let ctor = self.program.ctor_at(owner, tag);
             let fields =
