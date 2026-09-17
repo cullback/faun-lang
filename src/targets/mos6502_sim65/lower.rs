@@ -11,7 +11,7 @@ use super::{
     R0, T0, T1,
 };
 use crate::ir::{
-    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Program, Region, Relation,
+    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Origin, Program, Region, Relation,
     Terminator, ValueId, Width,
 };
 
@@ -57,7 +57,8 @@ fn assemble(program: &Program, heap: u16, far: Vec<bool>) -> (Code, Vec<usize>) 
     // The data sits at the front of the image and the code after it, so the
     // code's own addresses depend on how much data there is.
     let data = LOAD;
-    let origin = data + u16::try_from(program.data().len()).expect("data within 64 KiB");
+    let blob = program.data().len() + program.globals().len();
+    let origin = data + u16::try_from(blob).expect("data within 64 KiB");
 
     let mut state = Lowering {
         program,
@@ -217,7 +218,7 @@ impl Lowering<'_> {
                 self.set_pair(pair, word);
             }
             Source::Addr(id) => {
-                let at = self.data + u16::try_from(self.program.datum(id).0).expect("in range");
+                let at = self.address(id);
                 self.set_pair(pair, at);
             }
             Source::Slot(offset) => {
@@ -229,6 +230,19 @@ impl Lowering<'_> {
                 self.asm.sta_zp(pair + 1);
             }
         }
+    }
+
+    /// Where a datum sits. The image is loaded into RAM, so both regions
+    /// are writable and they differ only in where they begin.
+    fn address(&self, data: DataId) -> u16 {
+        let span = self.program.datum(data);
+        let base = match span.origin {
+            Origin::Data => self.data,
+            Origin::Globals => {
+                self.data + u16::try_from(self.program.data().len()).expect("in range")
+            }
+        };
+        base + u16::try_from(span.start).expect("in range")
     }
 
     /// Write a zero-page pair into `value`'s slot.

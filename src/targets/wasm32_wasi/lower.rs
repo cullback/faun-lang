@@ -9,7 +9,7 @@
 
 use super::{Body, CALL, Code, DROP, END, I32_CONST, Segment};
 use crate::ir::{
-    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Program, Region, Relation,
+    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Origin, Program, Region, Relation,
     Terminator, ValueId, Width,
 };
 use crate::targets::bytes::{Bytes, len32};
@@ -254,10 +254,12 @@ impl Lowering<'_> {
                 bytes: vectors,
             });
         }
-        if !self.program.data().is_empty() {
+        let mut blob = self.program.data().to_vec();
+        blob.extend_from_slice(self.program.globals());
+        if !blob.is_empty() {
             data.push(Segment {
                 offset: data_start,
-                bytes: self.program.data().to_vec(),
+                bytes: blob,
             });
         }
         data
@@ -539,7 +541,7 @@ impl Lowering<'_> {
                 self.constant_i32(narrow.cast_signed());
             }
             Source::Addr(data) => {
-                let address = self.data_start + self.program.datum(data).0;
+                let address = self.address(data);
                 self.constant_i32(address.cast_signed());
             }
             Source::Local(index) => {
@@ -570,9 +572,20 @@ impl Lowering<'_> {
             Source::Const(value) => {
                 Some(u32::try_from(value).expect("a word this target can hold"))
             }
-            Source::Addr(data) => Some(self.data_start + self.program.datum(data).0),
+            Source::Addr(data) => Some(self.address(data)),
             Source::Local(_) => None,
         }
+    }
+
+    /// Where a datum sits in linear memory. Both regions are writable here,
+    /// so they differ only in where they begin.
+    fn address(&self, data: DataId) -> u32 {
+        let span = self.program.datum(data);
+        let base = match span.origin {
+            Origin::Data => self.data_start,
+            Origin::Globals => self.data_start + len32(self.program.data().len()),
+        };
+        base + span.start
     }
 
     fn constant_i32(&mut self, value: i32) {

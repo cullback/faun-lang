@@ -14,6 +14,7 @@ pub(super) fn image(code: &Code, program: &Program) -> Vec<u8> {
     out.extend_from_slice(&code.reset.to_le_bytes());
 
     out.extend_from_slice(program.data());
+    out.extend_from_slice(program.globals());
     out.extend_from_slice(&code.bytes);
     out
 }

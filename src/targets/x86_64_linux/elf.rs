@@ -31,15 +31,17 @@
 //!   `mmap` and the stack from the kernel, so neither needs a segment.
 
 use super::Code;
-use crate::ir::Program;
+use crate::ir::{Origin, Program};
 use crate::targets::bytes::{Bytes, len32};
 
 pub(super) const EHDR_LEN: u16 = 64;
 pub(super) const PHDR_LEN: u16 = 56;
 const PAGE_SIZE: u64 = 0x1000;
+const PAGE: usize = 0x1000;
 
 /// `p_flags`.
 const READ: u32 = 4;
+const WRITE: u32 = 2;
 const EXECUTE: u32 = 1;
 
 /// One mapping the kernel makes.
@@ -47,6 +49,9 @@ struct Segment {
     flags: u32,
     start: u32,
     len: u32,
+    /// Where it is mapped, which for everything but the writable region is
+    /// its own file offset.
+    vaddr: u32,
 }
 
 pub(super) fn image(code: &Code, program: &Program) -> Vec<u8> {
@@ -59,6 +64,7 @@ pub(super) fn image(code: &Code, program: &Program) -> Vec<u8> {
     }
     out.bytes(&relocated(code, &layout, program));
     out.bytes(program.data());
+    out.bytes(program.globals());
 
     out.finish()
 }
@@ -67,26 +73,47 @@ struct Layout {
     /// File offset of the code, and of the data that follows it.
     text: usize,
     data: usize,
+    /// Where the globals are *mapped*, which is not where they sit in the
+    /// file: they need a page of their own to be writable in.
+    globals_at: usize,
     segments: Vec<Segment>,
 }
 
 impl Layout {
     fn new(code: &Code, program: &Program) -> Self {
-        // One mapping covers the file, its own headers included.
-        let count = 1;
+        // What is only read shares one mapping with the code and the headers.
+        // What is written needs its own, and only exists when something is.
+        let writable = !program.globals().is_empty();
+        let count = 1 + usize::from(writable);
         let text = usize::from(EHDR_LEN) + usize::from(PHDR_LEN) * count;
         let data = text + code.bytes.len();
+        let globals = data + program.data().len();
 
-        let segments = vec![Segment {
+        // A page further on. The two mappings then land on different pages
+        // of memory while sharing one page of the file, which the kernel
+        // allows so long as an address matches its offset modulo a page.
+        let globals_at = globals + PAGE;
+
+        let mut segments = vec![Segment {
             flags: READ | EXECUTE,
             start: 0,
-            len: len32(data + program.data().len()),
+            len: len32(globals),
+            vaddr: 0,
         }];
+        if writable {
+            segments.push(Segment {
+                flags: READ | WRITE,
+                start: len32(globals),
+                len: len32(program.globals().len()),
+                vaddr: len32(globals_at),
+            });
+        }
         debug_assert_eq!(segments.len(), count);
 
         Self {
             text,
             data,
+            globals_at,
             segments,
         }
     }
@@ -98,8 +125,14 @@ fn relocated(code: &Code, layout: &Layout, program: &Program) -> Vec<u8> {
     let mut text = code.bytes.clone();
     for reloc in &code.relocs {
         let from = layout.text + reloc.offset + 4;
-        let start = usize::try_from(program.datum(reloc.data).0).expect("an offset in the image");
-        let to = layout.data + start;
+        let span = program.datum(reloc.data);
+        let start = usize::try_from(span.start).expect("an offset in the image");
+        // Addresses, not file offsets: the two happen to agree everywhere
+        // but in the writable mapping, which sits a page further along.
+        let to = match span.origin {
+            Origin::Data => layout.data + start,
+            Origin::Globals => layout.globals_at + start,
+        };
         let displacement = to.abs_diff(from);
         let displacement = i32::try_from(displacement).expect("data within 2 GiB of the code");
         let displacement = if to < from {
@@ -141,8 +174,8 @@ fn program_header(out: &mut Bytes, segment: &Segment) {
     out.le32(1); // p_type: PT_LOAD
     out.le32(segment.flags);
     out.le64(u64::from(segment.start)); // p_offset
-    out.le64(u64::from(segment.start)); // p_vaddr
-    out.le64(u64::from(segment.start)); // p_paddr
+    out.le64(u64::from(segment.vaddr)); // p_vaddr
+    out.le64(u64::from(segment.vaddr)); // p_paddr
     out.le64(u64::from(segment.len)); // p_filesz
     out.le64(u64::from(segment.len)); // p_memsz
     out.le64(PAGE_SIZE); // p_align

@@ -25,6 +25,13 @@ fn the_mos6502_image_prints_hello_world() {
 }
 
 #[test]
+fn every_target_counts_in_a_global() {
+    for target in Target::ALL {
+        assert_eq!(status(target, &counts_in_a_global()), 3, "{target}");
+    }
+}
+
+#[test]
 fn every_target_wraps_a_fixed_width() {
     for target in Target::ALL {
         assert_eq!(status(target, &wraps_at_eight_bits()), 4, "{target}");
@@ -230,6 +237,32 @@ fn stores_a_byte() -> Program {
         let expected = b.constant(Word, 200);
         let intact = b.compare(Relation::Equal, first, expected);
         Terminator::Return(vec![b.binary(Binary::Add, intact, second)])
+    });
+    program
+}
+
+/// A counter in a writable datum, bumped by a function called three times.
+/// Nothing but storage outliving a call can answer 3.
+fn counts_in_a_global() -> Program {
+    let (mut program, main) = Program::new("main");
+    let counter = program.global(&[0; 8]);
+
+    let bump = program.declare("bump", Vec::new(), Vec::new());
+    program.define(bump, |b, _| {
+        let at = b.address_of(counter);
+        let seen = b.load(Width::Word, at, Offset::Words(0));
+        let one = b.constant(Word, 1);
+        let next = b.binary(Binary::Add, seen, one);
+        b.store(Width::Word, at, Offset::Words(0), next);
+        Terminator::Return(Vec::new())
+    });
+
+    program.define(main, |b, _| {
+        b.call(bump, Vec::new());
+        b.call(bump, Vec::new());
+        b.call(bump, Vec::new());
+        let at = b.address_of(counter);
+        Terminator::Return(vec![b.load(Width::Word, at, Offset::Words(0))])
     });
     program
 }

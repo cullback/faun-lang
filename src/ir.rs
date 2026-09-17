@@ -22,6 +22,25 @@ pub struct DataId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformId(pub usize);
 
+/// Which of a program's two regions a datum sits in.
+///
+/// They are kept apart so that a target may map what is only read
+/// differently from what is written, and so that a program writing nothing
+/// needs no writable region at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Data,
+    Globals,
+}
+
+/// Where a datum sits, and how long it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub origin: Origin,
+    pub start: u32,
+    pub len: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FunctionId(pub usize);
 
@@ -170,8 +189,9 @@ pub struct Program {
     /// Every datum end to end. A target adds its own base and nothing else,
     /// so two of them cannot disagree about the layout between.
     data: Vec<u8>,
-    /// Each datum's start and length within `data`.
-    spans: Vec<(u32, u32)>,
+    /// The same, for what a program may write to.
+    globals: Vec<u8>,
+    spans: Vec<Span>,
     functions: Vec<Function>,
     classes: Vec<Class>,
 }
@@ -195,6 +215,7 @@ impl Program {
         let mut program = Self {
             platform: Vec::new(),
             data: Vec::new(),
+            globals: Vec::new(),
             spans: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
@@ -207,11 +228,25 @@ impl Program {
     ///
     /// If the program's data outgrows the 4 GiB a target can address.
     pub fn intern(&mut self, bytes: &[u8]) -> DataId {
-        let start = u32::try_from(self.data.len()).expect("data within 4 GiB");
-        let length = u32::try_from(bytes.len()).expect("a datum within 4 GiB");
-        self.data.extend_from_slice(bytes);
-        self.spans.push((start, length));
-        DataId(self.spans.len() - 1)
+        Self::place(&mut self.data, &mut self.spans, Origin::Data, bytes)
+    }
+
+    /// The same, for a datum the program writes to. Its initial contents are
+    /// in the image, so a counter starting at zero is eight zero bytes.
+    ///
+    /// # Panics
+    ///
+    /// If the program's data outgrows the 4 GiB a target can address.
+    pub fn global(&mut self, bytes: &[u8]) -> DataId {
+        Self::place(&mut self.globals, &mut self.spans, Origin::Globals, bytes)
+    }
+
+    fn place(blob: &mut Vec<u8>, spans: &mut Vec<Span>, origin: Origin, bytes: &[u8]) -> DataId {
+        let start = u32::try_from(blob.len()).expect("data within 4 GiB");
+        let len = u32::try_from(bytes.len()).expect("a datum within 4 GiB");
+        blob.extend_from_slice(bytes);
+        spans.push(Span { origin, start, len });
+        DataId(spans.len() - 1)
     }
 
     pub fn platform(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> PlatformId {
@@ -265,7 +300,12 @@ impl Program {
     }
 
     #[must_use]
-    pub fn datum(&self, data: DataId) -> (u32, u32) {
+    pub fn globals(&self) -> &[u8] {
+        &self.globals
+    }
+
+    #[must_use]
+    pub fn datum(&self, data: DataId) -> Span {
         self.spans[data.0]
     }
 
@@ -329,8 +369,8 @@ impl Builder<'_> {
     }
 
     pub fn data_len(&mut self, data: DataId) -> ValueId {
-        let (_, length) = self.program.datum(data);
-        self.constant(Class::Word, u64::from(length))
+        let len = self.program.datum(data).len;
+        self.constant(Class::Word, u64::from(len))
     }
 
     pub fn binary(&mut self, op: Binary, left: ValueId, right: ValueId) -> ValueId {
