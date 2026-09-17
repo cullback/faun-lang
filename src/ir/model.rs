@@ -1,21 +1,25 @@
 //! The data model: operations, regions, declarations, and the pools they
 //! live in.
 
-use std::ops::Range;
-
 use crate::index::index;
 
-index!(ValueId, DataId, FunctionId, PlatformId, RegionId, OpId);
+// `Symbol` is a name, held as a run of characters in the program's own
+// pool. The IR never reads those characters: names are compared and copied
+// as integers, and the text comes back only to render one.
+index!(
+    ValueId, DataId, FunctionId, PlatformId, RegionId, OpId, Symbol
+);
 
-/// A run of values in the program's operand pool. Argument lists, region
-/// parameters and the values a terminator carries are all one of these.
+/// A run in one of the program's pools: the values an argument list holds,
+/// a region's parameters, the classes a signature names, the characters of
+/// a name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Operands {
+pub struct Range {
     pub(super) start: u32,
     pub(super) len: u32,
 }
 
-impl Operands {
+impl Range {
     /// # Panics
     ///
     /// Never, on any machine whose pointers reach 32 bits.
@@ -29,7 +33,18 @@ impl Operands {
         self.len == 0
     }
 
-    fn range(self) -> Range<usize> {
+    /// # Panics
+    ///
+    /// If the program outgrew the four billion entries a pool may hold.
+    #[must_use]
+    pub fn of(start: usize, len: usize) -> Self {
+        Self {
+            start: u32::try_from(start).expect("a pool within 4G"),
+            len: u32::try_from(len).expect("a run within 4G"),
+        }
+    }
+
+    pub(super) fn range(self) -> std::ops::Range<usize> {
         let start = usize::try_from(self.start).expect("an index that fits a pointer");
         start..start + self.len()
     }
@@ -71,9 +86,9 @@ pub enum Class {
 /// and rejects the rest by name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Platform {
-    pub name: String,
-    pub params: Vec<Class>,
-    pub returns: Vec<Class>,
+    pub name: Symbol,
+    pub params: Range,
+    pub returns: Range,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,11 +155,11 @@ pub enum Op {
     },
     PlatformCall {
         platform: PlatformId,
-        args: Operands,
+        args: Range,
     },
     Call {
         function: FunctionId,
-        args: Operands,
+        args: Range,
     },
     If {
         condition: ValueId,
@@ -154,7 +169,7 @@ pub enum Op {
     /// Runs `body` with `initial`, then with whatever each `Continue`
     /// carries, until a `Break` leaves.
     Loop {
-        initial: Operands,
+        initial: Range,
         body: RegionId,
     },
 }
@@ -172,29 +187,30 @@ pub enum Exit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Terminator {
     pub exit: Exit,
-    pub values: Operands,
+    pub values: Range,
 }
 
 impl Terminator {
     pub const UNREACHABLE: Self = Self {
         exit: Exit::Unreachable,
-        values: Operands { start: 0, len: 0 },
+        values: Range { start: 0, len: 0 },
     };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region {
-    pub params: Operands,
+    pub params: Range,
     /// The instructions, contiguous, so that walking one is a scan.
-    pub ops: Operands,
+    pub ops: Range,
     pub terminator: Terminator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
-    pub name: String,
-    pub params: Operands,
-    pub returns: Vec<Class>,
+    pub name: Symbol,
+    /// The values its parameters are, minted with it.
+    pub params: Range,
+    pub returns: Range,
     pub body: RegionId,
 }
 
@@ -208,27 +224,56 @@ pub struct Program {
     pub(super) globals: Vec<u8>,
     pub(super) spans: Vec<Span>,
     pub(super) functions: Vec<Function>,
+    /// The class of every value, by value.
     pub(super) classes: Vec<Class>,
+    /// The classes a signature names: what a platform routine or a function
+    /// takes and answers.
+    pub(super) signature: Vec<Class>,
     pub(super) ops: Vec<Op>,
     /// What each instruction defines, beside it rather than in it: a pass
     /// that does not care never reads this array.
-    pub(super) results: Vec<Operands>,
+    pub(super) results: Vec<Range>,
     pub(super) operands: Vec<ValueId>,
     pub(super) regions: Vec<Region>,
+    /// Every name the program uses, each once, end to end.
+    pub(super) names: Vec<u8>,
+    pub(super) symbols: Vec<Range>,
 }
 impl Program {
     /// Keep a list of existing values, giving back the run it occupies.
-    pub(super) fn hold(&mut self, values: &[ValueId]) -> Operands {
+    pub(super) fn hold(&mut self, values: &[ValueId]) -> Range {
         let start = u32::try_from(self.operands.len()).expect("a program within 4G operands");
         self.operands.extend_from_slice(values);
-        Operands {
+        Range {
             start,
             len: u32::try_from(values.len()).expect("a sane arity"),
         }
     }
 
+    /// The name a symbol stands for.
+    ///
+    /// # Panics
+    ///
+    /// If the symbol came from another program.
+    /// The classes a run of a signature names.
     #[must_use]
-    pub fn values(&self, operands: Operands) -> &[ValueId] {
+    pub fn signature(&self, range: Range) -> &[Class] {
+        &self.signature[range.range()]
+    }
+
+    /// The name a symbol stands for.
+    ///
+    /// # Panics
+    ///
+    /// If the symbol came from another program.
+    #[must_use]
+    pub fn name(&self, symbol: Symbol) -> &str {
+        let at = self.symbols[symbol.index()];
+        std::str::from_utf8(&self.names[at.range()]).expect("a name was written as text")
+    }
+
+    #[must_use]
+    pub fn values(&self, operands: Range) -> &[ValueId] {
         &self.operands[operands.range()]
     }
 

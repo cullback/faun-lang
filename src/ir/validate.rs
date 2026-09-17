@@ -11,7 +11,9 @@ use super::model::{Class, Exit, Op, Program, RegionId};
 /// Names the first disagreement found.
 pub fn validate(program: &Program) -> Result<(), String> {
     for function in program.functions() {
-        check(program, &function.name, function.body, &function.returns)?;
+        let name = program.name(function.name);
+        let returns = program.signature(function.returns);
+        check(program, name, function.body, returns)?;
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 //! Building well-shaped programs.
 
 use super::model::{
-    Binary, Class, DataId, Exit, Function, FunctionId, Offset, Op, Operands, Origin, Platform,
-    PlatformId, Program, Region, RegionId, Relation, Span, Terminator, ValueId, Width, wrap,
+    Binary, Class, DataId, Exit, Function, FunctionId, Offset, Op, Origin, Platform, PlatformId,
+    Program, Range, Region, RegionId, Relation, Span, Symbol, Terminator, ValueId, Width, wrap,
 };
 
 impl Program {
@@ -18,12 +18,15 @@ impl Program {
             spans: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            signature: Vec::new(),
             ops: Vec::new(),
             results: Vec::new(),
             operands: Vec::new(),
             regions: Vec::new(),
+            names: Vec::new(),
+            symbols: Vec::new(),
         };
-        let entry = program.declare(entry, &[], vec![Class::Word]);
+        let entry = program.declare(entry, &[], &[Class::Word]);
         (program, entry)
     }
 
@@ -52,9 +55,30 @@ impl Program {
         DataId::at(spans.len() - 1)
     }
 
-    pub fn platform(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> PlatformId {
+    /// The symbol for `name`, the same symbol every time. This runs once
+    /// per declaration and nowhere else, so the scan is over what a program
+    /// declares rather than over its terms.
+    ///
+    /// # Panics
+    ///
+    /// If the program outgrew the names it may have.
+    pub fn symbol(&mut self, name: &str) -> Symbol {
+        let held = |at: &Range| &self.names[at.range()] == name.as_bytes();
+        if let Some(at) = self.symbols.iter().position(held) {
+            return Symbol::at(at);
+        }
+        let at = self.names.len();
+        self.names.extend_from_slice(name.as_bytes());
+        self.symbols.push(Range::of(at, name.len()));
+        Symbol::at(self.symbols.len() - 1)
+    }
+
+    pub fn platform(&mut self, name: &str, params: &[Class], returns: &[Class]) -> PlatformId {
+        let name = self.symbol(name);
+        let params = self.sign(params);
+        let returns = self.sign(returns);
         self.platform.push(Platform {
-            name: name.to_owned(),
+            name,
             params,
             returns,
         });
@@ -63,15 +87,17 @@ impl Program {
 
     /// Separate from defining, so a body may call a function declared after
     /// it, or itself.
-    pub fn declare(&mut self, name: &str, params: &[Class], returns: Vec<Class>) -> FunctionId {
+    pub fn declare(&mut self, name: &str, params: &[Class], returns: &[Class]) -> FunctionId {
         let params = self.mint(params);
         self.regions.push(Region {
-            params: Operands::default(),
-            ops: Operands::default(),
+            params: Range::default(),
+            ops: Range::default(),
             terminator: Terminator::UNREACHABLE,
         });
+        let name = self.symbol(name);
+        let returns = self.sign(returns);
         self.functions.push(Function {
-            name: name.to_owned(),
+            name,
             params,
             returns,
             body: RegionId::at(self.regions.len() - 1),
@@ -100,13 +126,20 @@ impl Program {
     }
 
     /// Mint one value per class, and give back the run they occupy.
-    fn mint(&mut self, classes: &[Class]) -> Operands {
+    /// Hold a run of classes, for a signature.
+    fn sign(&mut self, classes: &[Class]) -> Range {
+        let at = self.signature.len();
+        self.signature.extend_from_slice(classes);
+        Range::of(at, classes.len())
+    }
+
+    fn mint(&mut self, classes: &[Class]) -> Range {
         let start = u32::try_from(self.operands.len()).expect("a program within 4G operands");
         for &class in classes {
             self.classes.push(class);
             self.operands.push(ValueId::at(self.classes.len() - 1));
         }
-        Operands {
+        Range {
             start,
             len: u32::try_from(classes.len()).expect("a sane arity"),
         }
@@ -121,9 +154,9 @@ impl Program {
 #[derive(Debug)]
 pub struct Builder<'a> {
     program: &'a mut Program,
-    params: Operands,
+    params: Range,
     ops: Vec<Op>,
-    results: Vec<Operands>,
+    results: Vec<Range>,
 }
 
 impl Builder<'_> {
@@ -184,15 +217,15 @@ impl Builder<'_> {
     }
 
     pub fn platform_call(&mut self, platform: PlatformId, args: &[ValueId]) -> Vec<ValueId> {
-        let returns = self.program.platform[platform.index()].returns.clone();
+        let returns = self.program.platform[platform.index()].returns;
         let args = self.program.hold(args);
-        self.push(Op::PlatformCall { platform, args }, &returns)
+        self.push_from(Op::PlatformCall { platform, args }, returns)
     }
 
     pub fn call(&mut self, function: FunctionId, args: &[ValueId]) -> Vec<ValueId> {
-        let returns = self.program.functions[function.index()].returns.clone();
+        let returns = self.program.functions[function.index()].returns;
         let args = self.program.hold(args);
-        self.push(Op::Call { function, args }, &returns)
+        self.push_from(Op::Call { function, args }, returns)
     }
 
     pub fn if_(
@@ -275,6 +308,12 @@ impl Builder<'_> {
         RegionId::at(self.program.regions.len() - 1)
     }
 
+    /// The same, for results a signature already names.
+    fn push_from(&mut self, op: Op, returns: Range) -> Vec<ValueId> {
+        let classes: Vec<Class> = self.program.signature(returns).to_vec();
+        self.push(op, &classes)
+    }
+
     fn push(&mut self, op: Op, classes: &[Class]) -> Vec<ValueId> {
         let results = self.program.mint(classes);
         let values = self.program.values(results).to_vec();
@@ -293,7 +332,7 @@ impl Builder<'_> {
 
         Region {
             params: self.params,
-            ops: Operands { start, len },
+            ops: Range { start, len },
             terminator,
         }
     }

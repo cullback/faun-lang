@@ -12,7 +12,7 @@ const MESSAGE: &[u8] = b"Hello, World!\n";
 pub fn hello_world() -> ir::Program {
     let (mut program, main) = ir::Program::new("main");
     let message = program.intern(MESSAGE);
-    let write = program.platform("write", vec![Class::Address, Class::Word], Vec::new());
+    let write = program.platform("write", &[Class::Address, Class::Word], &[]);
 
     program.define(main, |b, _| {
         let buf = b.address_of(message);

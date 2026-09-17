@@ -485,7 +485,8 @@ impl Lowering<'_> {
     }
 
     fn platform_call(&mut self, platform: PlatformId, args: &[ValueId], results: &[ValueId]) {
-        match self.program.platforms()[platform.index()].name.as_str() {
+        let name = self.program.platforms()[platform.index()].name;
+        match self.program.name(name) {
             "write" => {
                 // rax first, so stdout can be copied from it.
                 self.load_const(Reg::Rax, SYS_WRITE);
@@ -857,7 +858,7 @@ mod tests {
     fn a_syscall_invalidates_the_registers_it_clobbers() {
         let (mut program, main) = Program::new("main");
         let data = program.intern(b"x".as_slice());
-        let write = program.platform("write", vec![Class::Address, Class::Word], Vec::new());
+        let write = program.platform("write", &[Class::Address, Class::Word], &[]);
         program.define(main, |b, _| {
             let buf = b.address_of(data);
             let len = b.constant(Class::Word, 1);

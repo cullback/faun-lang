@@ -207,7 +207,7 @@ fn two_and_two() -> Program {
 /// the answer is the exit status rather than anything printed.
 fn calls_a_function() -> Program {
     let (mut program, main) = Program::new("main");
-    let double = program.declare("double", &[Word], vec![Word]);
+    let double = program.declare("double", &[Word], &[Word]);
     program.define(double, |b, params| {
         let n = params[0];
         let doubled = b.binary(Binary::Add, n, n);
@@ -226,7 +226,7 @@ fn calls_a_function() -> Program {
 /// frame that survives its own recursive call. 1 + 2 + 3 = 6.
 fn recurses() -> Program {
     let (mut program, main) = Program::new("main");
-    let sum = program.declare("sum", &[Word], vec![Word]);
+    let sum = program.declare("sum", &[Word], &[Word]);
     program.define(sum, |b, params| {
         let n = params[0];
         let zero = b.constant(Word, 0);
@@ -261,7 +261,7 @@ fn recurses() -> Program {
 /// Exits with what it read, so nothing but real memory can make it pass.
 fn uses_the_heap() -> Program {
     let (mut program, main) = Program::new("main");
-    let grow = program.platform("grow", vec![Word], vec![Class::Address]);
+    let grow = program.platform("grow", &[Word], &[Class::Address]);
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
@@ -286,8 +286,8 @@ fn uses_the_heap() -> Program {
 /// `13 + 7 + 12 + 10 + 3`.
 fn values_survive_a_call() -> Program {
     let (mut program, main) = Program::new("main");
-    let clobber = program.declare("clobber", &[Word], vec![Word]);
-    let outer = program.declare("outer", &[Word, Word], vec![Word]);
+    let clobber = program.declare("clobber", &[Word], &[Word]);
+    let outer = program.declare("outer", &[Word, Word], &[Word]);
 
     program.define(clobber, |b, params| {
         let x = params[0];
@@ -326,8 +326,8 @@ fn values_survive_a_call() -> Program {
 /// the case a target cannot answer with a block of constants.
 fn writes_from_the_heap() -> Program {
     let (mut program, main) = Program::new("main");
-    let grow = program.platform("grow", vec![Word], vec![Class::Address]);
-    let write = program.platform("write", vec![Class::Address, Word], Vec::new());
+    let grow = program.platform("grow", &[Word], &[Class::Address]);
+    let write = program.platform("write", &[Class::Address, Word], &[]);
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
@@ -353,7 +353,7 @@ fn writes_from_the_heap() -> Program {
 /// `(first == 200) + second`, so both have to hold to reach 8.
 fn stores_a_byte() -> Program {
     let (mut program, main) = Program::new("main");
-    let grow = program.platform("grow", vec![Word], vec![Class::Address]);
+    let grow = program.platform("grow", &[Word], &[Class::Address]);
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
@@ -380,7 +380,7 @@ fn counts_in_a_global() -> Program {
     let (mut program, main) = Program::new("main");
     let counter = program.global(&[0; 8]);
 
-    let bump = program.declare("bump", &[], Vec::new());
+    let bump = program.declare("bump", &[], &[]);
     program.define(bump, |b, _| {
         let at = b.address_of(counter);
         let seen = b.load(Width::Word, at, Offset::Words(0));
@@ -436,7 +436,7 @@ fn less(left: u64, right: u64) -> Program {
 fn countdown(times: u64) -> Program {
     let (mut program, main) = Program::new("main");
     let tick = program.intern(b"tick\n".as_slice());
-    let write = program.platform("write", vec![Class::Address, Word], Vec::new());
+    let write = program.platform("write", &[Class::Address, Word], &[]);
 
     program.define(main, |b, _| {
         let start = b.constant(Word, times);

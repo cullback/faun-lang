@@ -152,7 +152,7 @@ impl Plan {
             }
             match *op {
                 Op::PlatformCall { platform, .. }
-                    if program.platforms()[platform.index()].name == "write" =>
+                    if program.name(program.platforms()[platform.index()].name) == "write" =>
                 {
                     self.writes += 1;
                 }
@@ -490,7 +490,13 @@ impl Lowering<'_> {
         args: &[ValueId],
         results: &[ValueId],
     ) {
-        match self.program.platforms()[platform.index()].name.as_str() {
+        let name = self.program.platforms()[platform.index()].name;
+        let name = self.program.name(name).to_owned();
+        self.platform_named(&name, args, results);
+    }
+
+    fn platform_named(&mut self, name: &str, args: &[ValueId], results: &[ValueId]) {
+        match name {
             "write" => {
                 let index = self.written;
                 self.written += 1;

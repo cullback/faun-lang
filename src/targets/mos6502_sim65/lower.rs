@@ -70,7 +70,9 @@ impl Spans {
 fn uses_platform(program: &Program, name: &str) -> bool {
     fn within(program: &Program, region: RegionId, name: &str) -> bool {
         program.ops(region).iter().any(|op| match *op {
-            Op::PlatformCall { platform, .. } => program.platforms()[platform.index()].name == name,
+            Op::PlatformCall { platform, .. } => {
+                program.name(program.platforms()[platform.index()].name) == name
+            }
             Op::If {
                 then_region,
                 else_region,
@@ -1355,7 +1357,7 @@ impl Lowering<'_> {
                 self.convert(*class, *value, results[0]);
             }
             Op::PlatformCall { platform, args } => {
-                let name = &program.platforms()[platform.index()].name;
+                let name = program.name(program.platforms()[platform.index()].name);
                 self.platform_call(name, program.values(*args), results);
             }
             Op::Call { function, args } => {
