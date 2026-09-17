@@ -1,0 +1,218 @@
+//! The data model: terms, declarations, and the pools they live in.
+
+use crate::index::index;
+
+index!(ExprId, FnId, TypeId, CtorId, ConstId, Local);
+
+/// A run of values in one of the pools beside the arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Range {
+    pub(super) start: u32,
+    pub(super) len: u32,
+}
+
+impl Range {
+    /// # Panics
+    ///
+    /// Never, on any machine whose pointers reach 32 bits.
+    #[must_use]
+    pub fn len(self) -> usize {
+        usize::try_from(self.len).expect("a length that fits a pointer")
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub(super) fn of(start: usize, len: usize) -> Self {
+        Self {
+            start: u32::try_from(start).expect("a pool within 4G"),
+            len: u32::try_from(len).expect("a run within 4G"),
+        }
+    }
+
+    pub(super) fn range(self) -> std::ops::Range<usize> {
+        let start = usize::try_from(self.start).expect("an index that fits a pointer");
+        start..start + self.len()
+    }
+}
+
+/// An argument: a local, and nothing else. That is what A-normal form buys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Atom(pub Local);
+
+/// A term.
+///
+/// Binders are implicit. Locals are de Bruijn levels: a function's parameters
+/// are the first of them, a [`Expr::Let`] binds the next, and a [`Arm`] binds
+/// its constructor's fields in order. Two sibling arms reuse the same levels
+/// because they are alternative paths, so a term carries no names and two
+/// structurally equal terms are equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expr {
+    /// A bare atom.
+    Atom(Atom),
+    /// A saturated constructor application.
+    Con(CtorId, Range),
+    /// A value known outright, held encoded rather than as a chain of `Con`.
+    Static(TypeId, ConstId),
+    /// A saturated call to a top-level name. Every recursive edge is one.
+    Call(FnId, Range),
+    /// Binds the next local to the first, and continues with the second.
+    Let(ExprId, ExprId),
+    /// Destructuring. An arm per constructor of the scrutinee's type.
+    Match(Atom, Range),
+}
+
+/// One branch of a match. Binds its constructor's fields as the next locals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arm {
+    pub ctor: CtorId,
+    pub body: ExprId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Type {
+    pub name: String,
+    pub ctors: Range,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ctor {
+    pub name: String,
+    pub owner: TypeId,
+    /// The types of its fields, in order.
+    pub fields: Range,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Function {
+    pub name: String,
+    /// The types of its parameters, which are the first locals.
+    pub params: Range,
+    pub result: TypeId,
+    /// How many locals the body binds, parameters included.
+    pub locals: u32,
+    pub body: ExprId,
+}
+
+/// A program, and the pools every part of it lives in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Program {
+    pub(super) types: Vec<Type>,
+    pub(super) ctors: Vec<Ctor>,
+    pub(super) functions: Vec<Function>,
+    /// The term arena.
+    pub(super) exprs: Vec<Expr>,
+    /// Argument lists, for `Con` and `Call`.
+    pub(super) atoms: Vec<Atom>,
+    pub(super) arms: Vec<Arm>,
+    /// Field and parameter types.
+    pub(super) types_pool: Vec<TypeId>,
+    /// Known values, encoded. See [`super::constant`].
+    pub(super) consts: Vec<Const>,
+    pub(super) bytes: Vec<u8>,
+    pub(super) entry: Option<FnId>,
+}
+
+/// Where a known value's bytes are, and how many elements it has when its
+/// type is spine-shaped. Peeling a spine hands back a descriptor rather than
+/// rewriting its prefix, so a tail costs no bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Const {
+    pub(super) bytes: Range,
+    pub(super) count: u32,
+}
+
+impl Const {
+    /// How many elements the value has, when its type is spine-shaped.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.count
+    }
+}
+
+impl Program {
+    #[must_use]
+    pub fn type_(&self, id: TypeId) -> &Type {
+        &self.types[id.index()]
+    }
+
+    #[must_use]
+    pub fn ctor(&self, id: CtorId) -> &Ctor {
+        &self.ctors[id.index()]
+    }
+
+    #[must_use]
+    pub fn function(&self, id: FnId) -> &Function {
+        &self.functions[id.index()]
+    }
+
+    #[must_use]
+    pub fn expr(&self, id: ExprId) -> Expr {
+        self.exprs[id.index()]
+    }
+
+    #[must_use]
+    pub fn ctors(&self, id: TypeId) -> &[Ctor] {
+        &self.ctors[self.type_(id).ctors.range()]
+    }
+
+    /// Where `ctor` sits among its type's constructors, which is the tag a
+    /// known value carries.
+    #[must_use]
+    pub fn tag(&self, ctor: CtorId) -> u32 {
+        ctor.0 - self.type_(self.ctor(ctor).owner).ctors.start
+    }
+
+    #[must_use]
+    pub fn ctor_at(&self, owner: TypeId, tag: u32) -> CtorId {
+        CtorId(self.type_(owner).ctors.start + tag)
+    }
+
+    #[must_use]
+    pub fn fields(&self, ctor: CtorId) -> &[TypeId] {
+        &self.types_pool[self.ctor(ctor).fields.range()]
+    }
+
+    #[must_use]
+    pub fn params(&self, id: FnId) -> &[TypeId] {
+        &self.types_pool[self.function(id).params.range()]
+    }
+
+    #[must_use]
+    pub fn atoms(&self, range: Range) -> &[Atom] {
+        &self.atoms[range.range()]
+    }
+
+    #[must_use]
+    pub fn arms(&self, range: Range) -> &[Arm] {
+        &self.arms[range.range()]
+    }
+
+    #[must_use]
+    pub fn known(&self, id: ConstId) -> Const {
+        self.consts[id.index()]
+    }
+
+    #[must_use]
+    pub fn known_bytes(&self, id: ConstId) -> &[u8] {
+        &self.bytes[self.known(id).bytes.range()]
+    }
+
+    #[must_use]
+    pub const fn entry(&self) -> Option<FnId> {
+        self.entry
+    }
+
+    #[must_use]
+    pub fn types(&self) -> &[Type] {
+        &self.types
+    }
+
+    #[must_use]
+    pub fn functions(&self) -> &[Function] {
+        &self.functions
+    }
+}
