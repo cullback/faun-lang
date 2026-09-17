@@ -111,26 +111,9 @@ pub struct Program {
     /// Field and parameter types.
     pub(super) types_pool: Vec<TypeId>,
     /// Known values, encoded. See [`super::constant`].
-    pub(super) consts: Vec<Const>,
+    pub(super) consts: Vec<Range>,
     pub(super) bytes: Vec<u8>,
     pub(super) entry: Option<FnId>,
-}
-
-/// Where a known value's bytes are, and how many elements it has when its
-/// type is spine-shaped. Peeling a spine hands back a descriptor rather than
-/// rewriting its prefix, so a tail costs no bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Const {
-    pub(super) bytes: Range,
-    pub(super) count: u32,
-}
-
-impl Const {
-    /// How many elements the value has, when its type is spine-shaped.
-    #[must_use]
-    pub const fn count(self) -> u32 {
-        self.count
-    }
 }
 
 impl Program {
@@ -192,13 +175,8 @@ impl Program {
     }
 
     #[must_use]
-    pub fn known(&self, id: ConstId) -> Const {
-        self.consts[id.index()]
-    }
-
-    #[must_use]
     pub fn known_bytes(&self, id: ConstId) -> &[u8] {
-        &self.bytes[self.known(id).bytes.range()]
+        &self.bytes[self.consts[id.index()].range()]
     }
 
     #[must_use]

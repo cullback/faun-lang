@@ -6,9 +6,9 @@
 //! [`ExprId`].
 
 use super::constant;
-use super::ir::{Arm, Atom, Const, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local};
+use super::ir::{Arm, Atom, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local};
 use super::ir::{Program, Range, Type, TypeId};
-use constant::Value;
+use constant::{Shape, Value};
 
 impl Program {
     #[must_use]
@@ -72,15 +72,61 @@ impl Program {
     ///
     /// If `value` is not of type `id`.
     pub fn intern(&mut self, id: TypeId, value: &Value) -> ConstId {
-        let start = self.bytes.len();
         let mut bytes = Vec::new();
-        let count = constant::encode(self, id, value, &mut bytes);
-        let len = bytes.len();
-        self.bytes.extend_from_slice(&bytes);
-        self.consts.push(Const {
-            bytes: Range::of(start, len),
-            count,
-        });
+        constant::encode(self, id, value, &mut bytes);
+        self.hold(&bytes)
+    }
+
+    /// A number, written straight into the pool. The chain of constructors
+    /// it stands for is never built, which for a large one is the difference
+    /// between a few bytes and its own magnitude.
+    ///
+    /// # Panics
+    ///
+    /// If `id` is not a number: a spine whose elements carry nothing.
+    pub fn intern_number(&mut self, id: TypeId, value: u64) -> ConstId {
+        let Shape::Spine { cons, .. } = constant::shape(self, id) else {
+            panic!("`{}` is not a number", self.type_(id).name);
+        };
+        assert_eq!(
+            self.fields(cons).len(),
+            1,
+            "`{}` carries something per element",
+            self.type_(id).name
+        );
+        let mut bytes = Vec::new();
+        constant::write_number(value, &mut bytes);
+        self.hold(&bytes)
+    }
+
+    /// A run of bytes, likewise.
+    ///
+    /// # Panics
+    ///
+    /// If `id` is not a spine of numbers.
+    pub fn intern_bytes(&mut self, id: TypeId, value: &[u8]) -> ConstId {
+        let Shape::Spine { cons, .. } = constant::shape(self, id) else {
+            panic!("`{}` is not a sequence", self.type_(id).name);
+        };
+        let element = self
+            .fields(cons)
+            .iter()
+            .find(|field| **field != id)
+            .copied();
+        assert!(
+            element.is_some_and(|field| constant::as_number(self, field, &[0]).is_some()),
+            "`{}` does not hold numbers",
+            self.type_(id).name
+        );
+        let mut bytes = Vec::new();
+        constant::write_bytes(value, &mut bytes);
+        self.hold(&bytes)
+    }
+
+    fn hold(&mut self, bytes: &[u8]) -> ConstId {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(bytes);
+        self.consts.push(Range::of(start, bytes.len()));
         ConstId::at(self.consts.len() - 1)
     }
 

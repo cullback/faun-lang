@@ -111,6 +111,10 @@ pub(super) fn encode(program: &Program, id: TypeId, value: &Value, out: &mut Vec
 
 /// Read one value back, answering it and how many bytes it took.
 ///
+/// This builds the value in full, so a chain as long as its own magnitude
+/// costs that much: a number is better read with [`as_number`] and a run of
+/// bytes with [`as_bytes`].
+///
 /// # Panics
 ///
 /// If the bytes are not an encoding of this type, which the pool's own
@@ -185,27 +189,55 @@ fn decode_tagged(program: &Program, id: TypeId, bytes: &[u8]) -> (Value, usize) 
     }
 }
 
-/// The elements of a spine-shaped value, when each of them encoded to one
-/// byte. A run of bytes is then the value itself and a target can lift it
-/// into static memory as it stands.
+/// A spine-shaped value whose elements carry nothing, which is a number.
+/// Reading it costs nothing, where [`decode`] would build the whole chain.
 ///
 /// # Panics
 ///
 /// If the bytes are not an encoding of this type.
 #[must_use]
-pub fn as_bytes<'a>(
-    program: &Program,
-    id: TypeId,
-    bytes: &'a [u8],
-    count: u32,
-) -> Option<&'a [u8]> {
+pub fn as_number(program: &Program, id: TypeId, bytes: &[u8]) -> Option<u64> {
+    let Shape::Spine { cons, .. } = shape(program, id) else {
+        return None;
+    };
+    (program.fields(cons).len() == 1).then(|| unleb128(bytes).0)
+}
+
+/// The elements of a spine-shaped value, when each of them encoded to one
+/// byte.
+///
+/// The run is then the value itself, so a target can lift it into static
+/// memory as it stands rather than walking it element by element.
+///
+/// # Panics
+///
+/// If the bytes are not an encoding of this type.
+#[must_use]
+pub fn as_bytes<'a>(program: &Program, id: TypeId, bytes: &'a [u8]) -> Option<&'a [u8]> {
     if !matches!(shape(program, id), Shape::Spine { .. }) {
         return None;
     }
-    let (_, at) = unleb128(bytes);
+    let (count, at) = unleb128(bytes);
     let payload = &bytes[at..];
-    (payload.len() == usize::try_from(count).expect("a count that fits a pointer"))
-        .then_some(payload)
+    let count = usize::try_from(count).expect("a count that fits a pointer");
+    (payload.len() == count).then_some(payload)
+}
+
+/// Write a number straight into the pool, without building the chain of
+/// constructors it stands for.
+pub(super) fn write_number(value: u64, out: &mut Vec<u8>) {
+    leb128(value, out);
+}
+
+/// The same for a run of bytes: the count, then each of them.
+pub(super) fn write_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    leb128(
+        u64::try_from(bytes.len()).expect("a run within 64 bits"),
+        out,
+    );
+    for byte in bytes {
+        leb128(u64::from(*byte), out);
+    }
 }
 
 /// Seven bits a byte, low first, with the high bit set while more follow.

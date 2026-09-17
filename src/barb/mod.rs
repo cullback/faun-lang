@@ -33,10 +33,10 @@ mod constant;
 mod ir;
 
 pub use builder::Builder;
-pub use constant::{Shape, Value, as_bytes, decode, shape};
+pub use constant::{Shape, Value, as_bytes, as_number, decode, shape};
 pub use ir::{
-    Arm, Atom, Const, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local, Program, Range,
-    Type, TypeId,
+    Arm, Atom, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local, Program, Range, Type,
+    TypeId,
 };
 
 #[cfg(test)]

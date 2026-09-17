@@ -68,6 +68,25 @@ fn a_natural_costs_the_logarithm_of_its_value() {
         decode(&program, nat_id, program.known_bytes(id)).0,
         thousand
     );
+    assert_eq!(
+        as_number(&program, nat_id, program.known_bytes(id)),
+        Some(1000)
+    );
+}
+
+/// The same bytes, without ever building the chain they stand for. `decode`
+/// and the tree a caller hands `intern` both cost the magnitude; these do not.
+#[test]
+fn a_number_and_a_run_of_bytes_can_be_written_outright() {
+    let (mut program, nat_id, byte, list_id) = types();
+    let chain = program.intern(nat_id, &nat(&program, nat_id, 1000));
+    let direct = program.intern_number(nat_id, 1000);
+    assert_eq!(program.known_bytes(chain), program.known_bytes(direct));
+
+    let built = list(&program, list_id, byte, b"Hello");
+    let chain = program.intern(list_id, &built);
+    let direct = program.intern_bytes(list_id, b"Hello");
+    assert_eq!(program.known_bytes(chain), program.known_bytes(direct));
 }
 
 #[test]
@@ -77,8 +96,7 @@ fn an_ascii_string_is_its_own_bytes_after_the_count() {
     let id = program.intern(list_id, &hello);
     assert_eq!(program.known_bytes(id), b"\x05Hello");
 
-    let held = program.known(id);
-    let lifted = as_bytes(&program, list_id, program.known_bytes(id), held.count());
+    let lifted = as_bytes(&program, list_id, program.known_bytes(id));
     assert_eq!(lifted, Some(&b"Hello"[..]), "liftable as it stands");
     assert_eq!(decode(&program, list_id, program.known_bytes(id)).0, hello);
 }
@@ -90,8 +108,7 @@ fn a_string_past_ascii_is_not_liftable() {
     let (mut program, _, byte, list_id) = types();
     let cafe = list(&program, list_id, byte, "café".as_bytes());
     let id = program.intern(list_id, &cafe);
-    let held = program.known(id);
-    assert!(as_bytes(&program, list_id, program.known_bytes(id), held.count()).is_none());
+    assert!(as_bytes(&program, list_id, program.known_bytes(id)).is_none());
     assert_eq!(decode(&program, list_id, program.known_bytes(id)).0, cafe);
 }
 
