@@ -37,14 +37,60 @@ impl Reg {
     }
 }
 
+/// A displacement left to be filled in, and how much room was left for it.
+struct Fixup {
+    at: usize,
+    size: usize,
+    /// Which branch, for the ones that could be shortened.
+    branch: Option<usize>,
+    target: Option<usize>,
+}
+
 #[derive(Default)]
 pub(super) struct Encoder {
     bytes: Vec<u8>,
+    fixups: Vec<Fixup>,
+    /// Branches, by number, already found not to reach in one byte.
+    distant: Vec<bool>,
+    branches: usize,
+    /// Whether anything was written to a frame slot, which is what says a
+    /// frame was needed at all.
+    spilled: bool,
 }
 
 impl Encoder {
-    pub(super) fn finish(self) -> Vec<u8> {
-        self.bytes
+    pub(super) fn new(distant: Vec<bool>) -> Self {
+        Self {
+            distant,
+            ..Self::default()
+        }
+    }
+
+    pub(super) const fn spilled(&self) -> bool {
+        self.spilled
+    }
+
+    /// Fill every displacement, and report the branches that turned out not
+    /// to reach in the byte they were given.
+    pub(super) fn finish(mut self) -> (Vec<u8>, Vec<usize>) {
+        let mut overflowed = Vec::new();
+        for fixup in std::mem::take(&mut self.fixups) {
+            let target = fixup.target.expect("every jump is aimed");
+            let from = fixup.at + fixup.size;
+            let displacement = i64::try_from(target).expect("a reachable offset")
+                - i64::try_from(from).expect("a reachable offset");
+
+            if fixup.size == 1 {
+                match i8::try_from(displacement) {
+                    Ok(near) => self.bytes[fixup.at] = near.cast_unsigned(),
+                    Err(_) => overflowed.push(fixup.branch.expect("a branch")),
+                }
+            } else {
+                let displacement = i32::try_from(displacement).expect("a jump within 2 GiB");
+                self.bytes[fixup.at..fixup.at + 4].copy_from_slice(&displacement.to_le_bytes());
+            }
+        }
+        (self.bytes, overflowed)
     }
 
     /// The shortest zeroing, and it clears all 64 bits despite naming the
@@ -120,6 +166,24 @@ impl Encoder {
         self.emit(&disp.to_le_bytes());
     }
 
+    /// Whether [`Encoder::narrow`] has anything to do at this width. When
+    /// it has not, a conversion to it is the value it converted.
+    pub(super) const fn narrows(bits: u16) -> bool {
+        matches!(bits, 8 | 16)
+    }
+
+    /// `rax` taken modulo two to the `bits`. Only the widths whose own form
+    /// leaves the upper bits alone need this; the 32-bit forms already
+    /// zero-extend into the whole register.
+    pub(super) fn narrow(&mut self, bits: u16) {
+        match bits {
+            8 => self.emit(&[0x48, 0x0F, 0xB6, 0xC0]), // movzx rax, al
+            16 => self.emit(&[0x48, 0x0F, 0xB7, 0xC0]), // movzx rax, ax
+            32 | 64 => {}
+            other => panic!("no {other}-bit form on this target"),
+        }
+    }
+
     pub(super) fn syscall(&mut self) {
         self.emit(&[0x0F, 0x05]);
     }
@@ -134,15 +198,39 @@ impl Encoder {
         self.slot(0x89, src, disp);
     }
 
+    /// The `ModRM` mode says how much displacement follows, so a slot near
+    /// the stack pointer costs less to reach than a distant one.
     fn slot(&mut self, opcode: u8, reg: Reg, disp: u32) {
+        self.spilled = true;
+        let mode = match disp {
+            0 => 0x00,
+            1..=0x7F => 0x40,
+            _ => 0x80,
+        };
         self.emit(&[0x48 | (u8::from(reg.extended()) << 2), opcode]);
-        self.emit(&[0x80 | (reg.low() << 3) | 4, 0x24]);
-        self.emit(&disp.to_le_bytes());
+        self.emit(&[mode | (reg.low() << 3) | 4, 0x24]);
+        match mode {
+            0x00 => {}
+            0x40 => self.emit(&[disp.to_le_bytes()[0]]),
+            _ => self.emit(&disp.to_le_bytes()),
+        }
     }
 
     pub(super) fn open_frame(&mut self, bytes: u32) {
-        self.emit(&[0x48, 0x81, 0xEC]);
-        self.emit(&bytes.to_le_bytes());
+        self.adjust_rsp(0xEC, bytes);
+    }
+
+    /// `dst = dst op src` at the width a class fixes. The 32-bit form is
+    /// the one to reach for: it zero-extends into the whole register, so
+    /// nothing has to follow it.
+    pub(super) fn alu_sized(&mut self, opcode: u8, dst: Reg, src: Reg, bits: u16) {
+        match bits {
+            8 => self.emit(&[opcode - 1, modrm(src, dst)]),
+            16 => self.emit(&[0x66, opcode, modrm(src, dst)]),
+            32 => self.emit(&[opcode, modrm(src, dst)]),
+            64 => self.alu(opcode, dst, src),
+            other => panic!("no {other}-bit form on this target"),
+        }
     }
 
     /// `dst = dst op src`.
@@ -165,13 +253,19 @@ impl Encoder {
     pub(super) fn lea_rip(&mut self, dst: Reg) -> usize {
         self.rex(true, Some(dst), Reg::Rax);
         self.emit(&[0x8D, (dst.low() << 3) | 5]);
-        self.hole()
+        // The linker fills this one in, not [`Encoder::patch`], so it is a
+        // byte offset rather than a fixup.
+        let at = self.bytes.len();
+        self.emit(&[0; 4]);
+        at
     }
 
     /// Leaves a hole for [`Encoder::patch`], like any other displacement.
+    /// There is no short form of a call, so this is always a full
+    /// displacement.
     pub(super) fn call(&mut self) -> usize {
         self.emit(&[0xE8]);
-        self.hole()
+        self.hole(4, None)
     }
 
     pub(super) fn ret(&mut self) {
@@ -183,39 +277,73 @@ impl Encoder {
     }
 
     pub(super) fn close_frame(&mut self, bytes: u32) {
-        self.emit(&[0x48, 0x81, 0xC4]);
-        self.emit(&bytes.to_le_bytes());
+        self.adjust_rsp(0xC4, bytes);
+    }
+
+    /// `sub rsp` or `add rsp`, which differ only in their `ModRM`. The
+    /// sign-extended byte form takes three bytes fewer, so a small frame
+    /// uses it.
+    fn adjust_rsp(&mut self, modrm: u8, bytes: u32) {
+        if let Ok(small) = i8::try_from(bytes) {
+            self.emit(&[0x48, 0x83, modrm, small.cast_unsigned()]);
+        } else {
+            self.emit(&[0x48, 0x81, modrm]);
+            self.emit(&bytes.to_le_bytes());
+        }
     }
 
     /// Unconditional, or taken when the flags satisfy `cc`. Both leave a
     /// hole, and return its offset.
     pub(super) fn jump(&mut self) -> usize {
-        self.emit(&[0xE9]);
-        self.hole()
+        let branch = self.take_branch();
+        if self.far(branch) {
+            self.emit(&[0xE9]);
+            self.hole(4, Some(branch))
+        } else {
+            self.emit(&[0xEB]);
+            self.hole(1, Some(branch))
+        }
     }
 
     pub(super) fn jump_if(&mut self, cc: u8) -> usize {
-        self.emit(&[0x0F, 0x80 | cc]);
-        self.hole()
+        let branch = self.take_branch();
+        if self.far(branch) {
+            self.emit(&[0x0F, 0x80 | cc]);
+            self.hole(4, Some(branch))
+        } else {
+            self.emit(&[0x70 | cc]);
+            self.hole(1, Some(branch))
+        }
     }
 
-    fn hole(&mut self) -> usize {
-        let at = self.bytes.len();
-        self.emit(&[0; 4]);
-        at
+    const fn take_branch(&mut self) -> usize {
+        self.branches += 1;
+        self.branches - 1
+    }
+
+    fn far(&self, branch: usize) -> bool {
+        self.distant.get(branch).copied().unwrap_or(false)
+    }
+
+    fn hole(&mut self, size: usize, branch: Option<usize>) -> usize {
+        let fixup = self.fixups.len();
+        self.fixups.push(Fixup {
+            at: self.bytes.len(),
+            size,
+            branch,
+            target: None,
+        });
+        self.emit(&vec![0; size]);
+        fixup
     }
 
     pub(super) const fn here(&self) -> usize {
         self.bytes.len()
     }
 
-    /// Displacements count from the end of the instruction, which is the
-    /// end of the hole.
-    pub(super) fn patch(&mut self, hole: usize, target: usize) {
-        let from = i64::try_from(hole + 4).expect("a reachable offset");
-        let to = i64::try_from(target).expect("a reachable offset");
-        let displacement = i32::try_from(to - from).expect("a jump within 2 GiB");
-        self.bytes[hole..hole + 4].copy_from_slice(&displacement.to_le_bytes());
+    /// Where a jump is going, resolved once every address is known.
+    pub(super) fn patch(&mut self, fixup: usize, target: usize) {
+        self.fixups[fixup].target = Some(target);
     }
 
     /// `reg` is `None` for the forms with no `ModRM` byte. Omitted entirely
@@ -244,7 +372,7 @@ mod tests {
     fn encoded(build: impl FnOnce(&mut Encoder)) -> Vec<u8> {
         let mut asm = Encoder::default();
         build(&mut asm);
-        asm.finish()
+        asm.finish().0
     }
 
     #[test]

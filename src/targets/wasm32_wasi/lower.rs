@@ -9,8 +9,8 @@
 
 use super::{Body, CALL, Code, DROP, END, I32_CONST, Segment};
 use crate::ir::{
-    Binary, DataId, FunctionId, Instruction, Offset, Op, Program, Region, Relation, Terminator,
-    ValueId, Width,
+    Binary, Class, DataId, FunctionId, Instruction, Offset, Op, Program, Region, Relation,
+    Terminator, ValueId, Width,
 };
 use crate::targets::bytes::{Bytes, len32};
 
@@ -35,18 +35,29 @@ const I32_LOAD: u8 = 0x28;
 const I32_LOAD8_U: u8 = 0x2D;
 const I32_STORE: u8 = 0x36;
 const I32_STORE8: u8 = 0x3A;
+const I32_AND: u8 = 0x71;
 const I32_SHL: u8 = 0x74;
 const I32_SHR_U: u8 = 0x76;
 const MEMORY_GROW: u8 = 0x40;
 
 /// A word on this target, in bytes, and a page as a power of two.
 const WORD: i64 = 4;
+/// A word here, in bits, which is what an unfixed class is held at.
+const WORD_BITS: u16 = 32;
 const PAGE_BITS: i32 = 16;
 const I32_ADD: u8 = 0x6A;
 const I32_SUB: u8 = 0x6B;
 const I32_EQ: u8 = 0x46;
 const I32_LT_U: u8 = 0x49;
 const EMPTY: u8 = 0x40;
+
+/// How wide a class is held, which for anything unfixed is a word.
+const fn bits(class: Class) -> u16 {
+    match class {
+        Class::Fixed { bits } => bits,
+        Class::Word | Class::Address => WORD_BITS,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Source {
@@ -295,6 +306,12 @@ impl Lowering<'_> {
                 offset,
                 value,
             } => self.store_at(*width, *address, *offset, *value),
+            Op::Convert { class, value } => {
+                self.push(*value);
+                let kept = bits(*class).min(bits(self.program.class(*value)));
+                self.narrow(kept);
+                self.set(inst.results[0]);
+            }
             Op::PlatformCall { platform, args } => {
                 self.platform_call(*platform, args, &inst.results);
             }
@@ -327,6 +344,16 @@ impl Lowering<'_> {
         self.push(address);
         self.push(value);
         self.access(width, offset, I32_STORE8, I32_STORE);
+    }
+
+    /// A word here is 32 bits, so anything narrower is masked back down.
+    fn narrow(&mut self, kept: u16) {
+        assert!(kept <= WORD_BITS, "no {kept}-bit form on this target");
+        if kept < WORD_BITS {
+            let mask = (1u32 << kept) - 1;
+            self.constant_i32(mask.cast_signed());
+            self.body.byte(I32_AND);
+        }
     }
 
     fn binary(&mut self, opcode: u8, left: ValueId, right: ValueId, result: ValueId) {
@@ -478,7 +505,7 @@ impl Lowering<'_> {
             }
             // Linear memory only grows in pages, and `memory.grow` answers
             // with the old size, so the new region starts where it ended.
-            "alloc" => {
+            "grow" => {
                 self.push(args[0]);
                 self.constant_i32((1 << PAGE_BITS) - 1);
                 self.body.byte(I32_ADD);

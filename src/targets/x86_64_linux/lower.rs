@@ -9,8 +9,8 @@
 use super::encode::{Encoder, Reg};
 use super::{Code, Reloc};
 use crate::ir::{
-    Binary, DataId, Function, FunctionId, Instruction, Offset, Op, PlatformId, Program, Region,
-    Relation, Terminator, ValueId, Width,
+    Binary, Class, DataId, Function, FunctionId, Instruction, Offset, Op, PlatformId, Program,
+    Region, Relation, Terminator, ValueId, Width,
 };
 
 const SYS_WRITE: u64 = 1;
@@ -24,6 +24,9 @@ const MAP_PRIVATE_ANONYMOUS: u64 = 0x22;
 
 /// A word in bytes, which is what [`Offset::Words`] counts.
 const WORD: i64 = 8;
+
+/// A word here, in bits, which is what an unfixed class is held at.
+const WORD_BITS: u16 = 64;
 
 /// A syscall's fourth argument goes in r10, where the ordinary convention
 /// would use rcx.
@@ -51,25 +54,59 @@ const TRACKED: [Reg; 9] = [
     Reg::R11,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Source {
     Const(u64),
     Addr(DataId),
     Slot(u32),
 }
 
+/// Assembled until nothing changes. Two facts are only knowable once the
+/// addresses are: which jumps reach in a single byte, and whether a frame
+/// was ever written to. Shortening a jump can pull another into reach, so
+/// this repeats rather than assuming one pass settles it.
 pub(super) fn lower(program: &Program) -> Code {
+    let mut distant: Vec<bool> = Vec::new();
+    let mut framed = vec![true; program.functions().len()];
+    loop {
+        let (code, overflowed, spilled) = assemble(program, distant.clone(), &framed);
+        if !overflowed.is_empty() {
+            let widest = overflowed.iter().copied().max().expect("a branch");
+            distant.resize(widest + 1, false);
+            for branch in overflowed {
+                distant[branch] = true;
+            }
+            continue;
+        }
+        if framed != spilled {
+            framed = spilled;
+            continue;
+        }
+        return code;
+    }
+}
+
+fn assemble(
+    program: &Program,
+    distant: Vec<bool>,
+    framed: &[bool],
+) -> (Code, Vec<usize>, Vec<bool>) {
     let entry = program.entry();
     let mut state = Lowering {
         program,
         entry,
         in_entry: true,
         plan: Plan::empty(program),
-        asm: Encoder::default(),
+        asm: Encoder::new(distant),
+        framed: framed.to_vec(),
+        spilled: vec![false; program.functions().len()],
+        frame: 0,
         relocs: Vec::new(),
         calls: Vec::new(),
         starts: vec![0; program.functions().len()],
         known: [None; 16],
+        holds: [None; 16],
+        pending: None,
         ifs: Vec::new(),
         loops: Vec::new(),
     };
@@ -86,11 +123,16 @@ pub(super) fn lower(program: &Program) -> Code {
         state.asm.patch(hole, target);
     }
 
-    state.finish()
+    let spilled = state.spilled.clone();
+    let (code, overflowed) = state.finish();
+    (code, overflowed, spilled)
 }
 
 struct Plan {
     source: Vec<Source>,
+    /// How many times each value is read, which is what decides whether a
+    /// result is worth writing to its slot at all.
+    uses: Vec<u32>,
     scratch: u32,
     frame: u32,
 }
@@ -99,6 +141,7 @@ impl Plan {
     fn empty(program: &Program) -> Self {
         Self {
             source: vec![Source::Slot(0); program.values()],
+            uses: vec![0; program.values()],
             scratch: 0,
             frame: 0,
         }
@@ -110,13 +153,14 @@ impl Plan {
     fn new(program: &Program, function: &Function) -> Self {
         let mut plan = Self::empty(program);
         let mut widest = function.params.len();
-        plan.walk(&function.body, &mut widest);
+        plan.count(&function.body);
+        plan.walk(program, &function.body, &mut widest);
         plan.scratch = plan.frame;
         plan.frame += 8 * u32::try_from(widest).expect("a sane region width");
         plan
     }
 
-    fn walk(&mut self, region: &Region, widest: &mut usize) {
+    fn walk(&mut self, program: &Program, region: &Region, widest: &mut usize) {
         for &param in &region.params {
             self.give_slot(param);
         }
@@ -128,6 +172,17 @@ impl Plan {
                     self.source[inst.results[0].0] = Source::Const(*value);
                 }
                 Op::AddressOf(data) => self.source[inst.results[0].0] = Source::Addr(*data),
+                // A conversion that narrows nothing leaves the bits alone,
+                // so the result can live wherever the operand does.
+                Op::Convert { class, value }
+                    if !Encoder::narrows(bits(*class).min(bits(program.class(*value)))) =>
+                {
+                    let result = inst.results[0];
+                    self.source[result.0] = self.source[value.0];
+                    // The storage is shared, so its readers are too, and
+                    // this conversion is no longer one of them.
+                    self.uses[value.0] += self.uses[result.0] - 1;
+                }
                 _ => {
                     for &result in &inst.results {
                         self.give_slot(result);
@@ -140,19 +195,70 @@ impl Plan {
                     else_region,
                     ..
                 } => {
-                    self.walk(then_region, widest);
-                    self.walk(else_region, widest);
+                    self.walk(program, then_region, widest);
+                    self.walk(program, else_region, widest);
                 }
-                Op::Loop { body, .. } => self.walk(body, widest),
+                Op::Loop { body, .. } => self.walk(program, body, widest),
                 _ => {}
             }
         }
         *widest = (*widest).max(transferred(&region.terminator).len());
     }
 
+    /// Every read of every value, so that a result nothing reads is never
+    /// written and one read once may stay in a register.
+    fn count(&mut self, region: &Region) {
+        let mut read = |values: &[ValueId]| {
+            for &value in values {
+                self.uses[value.0] += 1;
+            }
+        };
+        for inst in &region.instructions {
+            match &inst.op {
+                Op::Constant { .. } | Op::AddressOf(_) => {}
+                Op::Binary { left, right, .. } | Op::Compare { left, right, .. } => {
+                    read(&[*left, *right]);
+                }
+                Op::Load { address, .. } => read(&[*address]),
+                Op::Store { address, value, .. } => read(&[*address, *value]),
+                Op::Convert { value, .. } => read(&[*value]),
+                Op::PlatformCall { args, .. } | Op::Call { args, .. } => read(args),
+                Op::If { condition, .. } => read(&[*condition]),
+                Op::Loop { initial, .. } => read(initial),
+            }
+        }
+        read(transferred(&region.terminator));
+        if let Terminator::Return(values) = &region.terminator {
+            read(values);
+        }
+
+        for inst in &region.instructions {
+            match &inst.op {
+                Op::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => {
+                    self.count(then_region);
+                    self.count(else_region);
+                }
+                Op::Loop { body, .. } => self.count(body),
+                _ => {}
+            }
+        }
+    }
+
     fn give_slot(&mut self, value: ValueId) {
         self.source[value.0] = Source::Slot(self.frame);
         self.frame += 8;
+    }
+}
+
+/// How wide a class is held, which for anything unfixed is a word.
+const fn bits(class: Class) -> u16 {
+    match class {
+        Class::Fixed { bits } => bits,
+        Class::Word | Class::Address => WORD_BITS,
     }
 }
 
@@ -202,16 +308,25 @@ struct Lowering<'a> {
     /// The constant each register is known to hold. `None` is unknown, which
     /// is not the same as zero.
     known: [Option<u64>; 16],
+    /// And which value, so reading one already in place costs nothing.
+    holds: [Option<ValueId>; 16],
+    /// A result sitting in rax whose slot has not been written, because its
+    /// one reader may take it from the register instead.
+    pending: Option<ValueId>,
+    /// Which functions were given a frame, and which turned out to write to
+    /// one. A function that never spills does not need one opened.
+    framed: Vec<bool>,
+    spilled: Vec<bool>,
+    frame: u32,
     ifs: Vec<IfFrame>,
     loops: Vec<LoopFrame>,
 }
 
 impl Lowering<'_> {
-    fn finish(self) -> Code {
-        Code {
-            bytes: self.asm.finish(),
-            relocs: self.relocs,
-        }
+    fn finish(self) -> (Code, Vec<usize>) {
+        let relocs = self.relocs;
+        let (bytes, overflowed) = self.asm.finish();
+        (Code { bytes, relocs }, overflowed)
     }
 
     fn function(&mut self, id: FunctionId) {
@@ -221,13 +336,20 @@ impl Lowering<'_> {
         self.plan = Plan::new(self.program, function);
         self.forget();
 
-        if self.plan.frame > 0 {
-            self.asm.open_frame(self.plan.frame);
+        self.frame = if self.framed[id.0] {
+            self.plan.frame
+        } else {
+            0
+        };
+        if self.frame > 0 {
+            self.asm.open_frame(self.frame);
         }
+        let opened = self.asm.spilled();
         for (&param, reg) in function.params.iter().zip(ARG_REGS) {
             self.store(param, reg);
         }
         self.region(&function.body);
+        self.spilled[id.0] = self.asm.spilled() && !opened;
     }
 
     fn region(&mut self, region: &Region) {
@@ -264,6 +386,17 @@ impl Lowering<'_> {
                 offset,
                 value,
             } => self.store_at(*width, *address, *offset, *value),
+            Op::Convert { class, value } => {
+                // Whatever the source made meaningful, kept as far as the
+                // target is wide. When that takes no instruction, the plan
+                // has already given the result the operand's storage.
+                let kept = bits(*class).min(bits(self.program.class(*value)));
+                if Encoder::narrows(kept) {
+                    self.read(Reg::Rax, *value);
+                    self.asm.narrow(kept);
+                    self.keep(inst.results[0]);
+                }
+            }
             Op::PlatformCall { platform, args } => {
                 self.platform_call(*platform, args, &inst.results);
             }
@@ -271,6 +404,7 @@ impl Lowering<'_> {
                 for (&arg, reg) in args.iter().zip(ARG_REGS) {
                     self.read(reg, arg);
                 }
+                self.flush();
                 let hole = self.asm.call();
                 self.calls.push((hole, *function));
                 // Every register this tracks is caller-saved.
@@ -294,8 +428,11 @@ impl Lowering<'_> {
             Relation::Equal => EQUAL,
             Relation::Less => BELOW,
         };
+        // At the operands' width: anything above it is undefined until a
+        // `Convert` says otherwise.
         self.pair(left, right);
-        self.asm.alu(0x39, Reg::Rax, Reg::Rcx);
+        self.asm
+            .alu_sized(0x39, Reg::Rax, Reg::Rcx, bits(self.program.class(left)));
         self.asm.set_if(cc, Reg::Rax);
         self.keep(result);
     }
@@ -306,12 +443,14 @@ impl Lowering<'_> {
             Binary::Sub => 0x29,
         };
         self.pair(left, right);
-        self.asm.alu(opcode, Reg::Rax, Reg::Rcx);
+        self.asm
+            .alu_sized(opcode, Reg::Rax, Reg::Rcx, bits(self.program.class(result)));
         self.keep(result);
     }
 
     fn load_at(&mut self, width: Width, address: ValueId, offset: Offset, result: ValueId) {
         self.read(Reg::Rcx, address);
+        self.flush();
         let disp = displacement(offset);
         match width {
             Width::Byte => self.asm.load_byte(Reg::Rax, Reg::Rcx, disp),
@@ -331,7 +470,6 @@ impl Lowering<'_> {
                 .asm
                 .store_word(Reg::Rax, Reg::Rcx, displacement(offset)),
         }
-        self.known[Reg::Rax.index()] = None;
     }
 
     fn platform_call(&mut self, platform: PlatformId, args: &[ValueId], results: &[ValueId]) {
@@ -348,7 +486,7 @@ impl Lowering<'_> {
                 self.read(Reg::Rdi, args[0]);
             }
             // The kernel picks the address, so nothing here has to.
-            "alloc" => {
+            "grow" => {
                 self.load_const(Reg::Rax, SYS_MMAP);
                 self.load_const(SYSCALL_REGS[0], 0);
                 self.read(SYSCALL_REGS[1], args[0]);
@@ -447,11 +585,13 @@ impl Lowering<'_> {
     /// Nothing calls the entry, so leaving it is exiting.
     fn leave(&mut self, values: &[ValueId]) {
         if self.in_entry {
-            self.load_const(Reg::Rax, SYS_EXIT);
+            // The status first: loading rax would settle any result still
+            // waiting there, and the status is often that result.
             match values.first() {
                 Some(&status) => self.read(Reg::Rdi, status),
                 None => self.load_const(Reg::Rdi, 0),
             }
+            self.load_const(Reg::Rax, SYS_EXIT);
             self.syscall();
             return;
         }
@@ -459,8 +599,8 @@ impl Lowering<'_> {
         if let Some(&value) = values.first() {
             self.read(Reg::Rax, value);
         }
-        if self.plan.frame > 0 {
-            self.asm.close_frame(self.plan.frame);
+        if self.frame > 0 {
+            self.asm.close_frame(self.frame);
         }
         self.asm.ret();
     }
@@ -475,9 +615,10 @@ impl Lowering<'_> {
             self.read(Reg::Rax, source);
             self.asm.store_slot(Reg::Rax, self.scratch(index));
         }
+        self.flush();
         for (index, &destination) in destinations.iter().enumerate() {
             self.asm.load_slot(Reg::Rax, self.scratch(index));
-            self.keep(destination);
+            self.store(destination, Reg::Rax);
         }
         self.forget();
     }
@@ -492,9 +633,34 @@ impl Lowering<'_> {
         self.read(Reg::Rcx, right);
     }
 
-    /// Write rax to wherever `value` lives.
+    /// Write rax to wherever `value` lives -- or not yet, when the value is
+    /// read exactly once and that reader may find it still in the register.
     fn keep(&mut self, value: ValueId) {
+        debug_assert!(self.pending.is_none(), "a result left unwritten");
+        if self.plan.uses[value.0] == 0 {
+            self.holds[Reg::Rax.index()] = Some(value);
+            return;
+        }
+        if self.plan.uses[value.0] == 1 {
+            self.known[Reg::Rax.index()] = None;
+            self.holds[Reg::Rax.index()] = Some(value);
+            self.pending = Some(value);
+            return;
+        }
         self.store(value, Reg::Rax);
+    }
+
+    /// Whether a register's occupant and `value` are the same as far as
+    /// storage goes, which an aliased conversion makes possible.
+    fn shares(&self, held: Option<ValueId>, value: ValueId) -> bool {
+        held.is_some_and(|held| self.plan.source[held.0] == self.plan.source[value.0])
+    }
+
+    /// Write out whatever rax is still holding on behalf of its slot.
+    fn flush(&mut self) {
+        if let Some(value) = self.pending.take() {
+            self.store(value, Reg::Rax);
+        }
     }
 
     fn store(&mut self, value: ValueId, from: Reg) {
@@ -502,24 +668,48 @@ impl Lowering<'_> {
             panic!("a computed value needs a slot");
         };
         self.asm.store_slot(from, offset);
+        // The register is unchanged, and now demonstrably holds `value`.
         self.known[from.index()] = None;
+        self.holds[from.index()] = Some(value);
     }
 
     fn read(&mut self, dst: Reg, value: ValueId) {
+        if self.shares(self.holds[dst.index()], value) {
+            if self.shares(self.pending, value) {
+                self.pending = None;
+            }
+            return;
+        }
+        // The one reader of a deferred result, wanting it elsewhere: a copy
+        // out of rax still beats writing and reading a slot.
+        if self.shares(self.pending, value) {
+            self.pending = None;
+            self.asm.mov_reg(dst, Reg::Rax, true);
+            self.known[dst.index()] = None;
+            self.holds[dst.index()] = Some(value);
+            return;
+        }
+        if dst.index() == Reg::Rax.index() {
+            self.flush();
+        }
         match self.plan.source[value.0] {
-            Source::Const(value) => self.load_const(dst, value),
+            Source::Const(constant) => self.load_const(dst, constant),
             Source::Addr(data) => self.load_addr(dst, data),
             Source::Slot(offset) => {
                 self.asm.load_slot(dst, offset);
                 self.known[dst.index()] = None;
             }
         }
+        self.holds[dst.index()] = Some(value);
     }
 
     /// The shortest encoding that leaves `value` in `dst`. The forms differ
     /// in how they fill the upper bits, so the choice is made over the whole
     /// 64-bit word rather than over any reading of it.
     fn load_const(&mut self, dst: Reg, value: u64) {
+        if dst.index() == Reg::Rax.index() {
+            self.flush();
+        }
         if self.known[dst.index()] == Some(value) {
             // Already there. Nothing to emit.
         } else if value == 0 {
@@ -537,14 +727,19 @@ impl Lowering<'_> {
             self.asm.mov_imm64(dst, value);
         }
         self.known[dst.index()] = Some(value);
+        self.holds[dst.index()] = None;
     }
 
     /// Addressed from the instruction pointer, so the program does not care
     /// where it was loaded and needs no relocation at startup.
     fn load_addr(&mut self, dst: Reg, data: DataId) {
+        if dst.index() == Reg::Rax.index() {
+            self.flush();
+        }
         let offset = self.asm.lea_rip(dst);
         self.relocs.push(Reloc { offset, data });
         self.known[dst.index()] = None;
+        self.holds[dst.index()] = None;
     }
 
     fn holding(&self, value: u64) -> Option<Reg> {
@@ -557,12 +752,19 @@ impl Lowering<'_> {
         self.asm.syscall();
         for reg in CLOBBERED {
             self.known[reg.index()] = None;
+            self.holds[reg.index()] = None;
         }
     }
 
     /// Control joins here from somewhere else, so nothing is known.
-    const fn forget(&mut self) {
+    fn forget(&mut self) {
+        self.flush();
+        self.wipe();
+    }
+
+    const fn wipe(&mut self) {
         self.known = [None; 16];
+        self.holds = [None; 16];
     }
 }
 
@@ -590,9 +792,10 @@ mod tests {
             0x6A, 0x0E,                   // push 14
             0x5A,                         // pop rdx          (message length)
             0x0F, 0x05,                   // syscall
-            0x6A, 0x3C,                   // push 60
-            0x58,                         // pop rax          (sys_exit)
-            0x31, 0xFF,                   // xor edi, edi     (status 0)
+            0x31, 0xFF,                   // xor edi, edi     (status 0, read
+            0x6A, 0x3C,                   //                   before rax, so
+            0x58,                         //                   a result still
+                                          //                   there survives)
             0x0F, 0x05,                   // syscall
         ];
         assert_eq!(code.bytes, expected);
@@ -622,13 +825,16 @@ mod tests {
         });
 
         let bytes = lower(&program).bytes;
-        // `ud2` for the unreachable tail, and before it a `jmp rel32` back to
-        // the loop head, which is behind us, so the displacement is negative.
+        // `ud2` for the unreachable tail, and before it a jump back to the
+        // loop head. The head is a few bytes behind, so the short form
+        // reaches it and the displacement is negative.
         let end = bytes.len() - 2;
         assert_eq!(&bytes[end..], [0x0F, 0x0B]);
-        assert_eq!(bytes[end - 5], 0xE9);
-        let displacement = i32::from_le_bytes(bytes[end - 4..end].try_into().unwrap());
-        assert!(displacement < 0, "a loop must branch backwards");
+        assert_eq!(bytes[end - 2], 0xEB, "a near loop takes the short jump");
+        assert!(
+            bytes[end - 1].cast_signed() < 0,
+            "a loop must branch backwards"
+        );
     }
 
     #[test]

@@ -19,6 +19,34 @@ fn the_x86_64_linux_executable_prints_hello_world() {
 }
 
 #[test]
+fn the_mos6502_image_prints_hello_world() {
+    let (output, _) = run(Target::Mos6502Sim65, &faun::hello_world());
+    assert_eq!(output, "Hello, World!\n");
+}
+
+#[test]
+fn every_target_wraps_a_fixed_width() {
+    for target in Target::ALL {
+        assert_eq!(status(target, &wraps_at_eight_bits()), 4, "{target}");
+    }
+}
+
+#[test]
+fn the_mos6502_image_runs_every_program() {
+    assert_eq!(status(Target::Mos6502Sim65, &empty()), 0);
+    assert_eq!(status(Target::Mos6502Sim65, &less(7, 9)), 1);
+    assert_eq!(status(Target::Mos6502Sim65, &less(9, 7)), 0);
+    assert_eq!(status(Target::Mos6502Sim65, &calls_a_function()), 42);
+    assert_eq!(status(Target::Mos6502Sim65, &recurses()), 6);
+    assert_eq!(
+        run(Target::Mos6502Sim65, &countdown(3)).0,
+        "tick\n".repeat(3)
+    );
+    assert_eq!(status(Target::Mos6502Sim65, &uses_the_heap()), 42);
+    assert_eq!(status(Target::Mos6502Sim65, &stores_a_byte()), 8);
+}
+
+#[test]
 fn the_wasm32_wasi_module_prints_hello_world() {
     let (output, bytes) = run(Target::Wasm32Wasi, &faun::hello_world());
     assert_eq!(output, "Hello, World!\n");
@@ -165,11 +193,11 @@ fn recurses() -> Program {
 /// Exits with what it read, so nothing but real memory can make it pass.
 fn uses_the_heap() -> Program {
     let (mut program, main) = Program::new("main");
-    let alloc = program.platform("alloc", vec![Word], vec![Class::Address]);
+    let grow = program.platform("grow", vec![Word], vec![Class::Address]);
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
-        let page = b.platform_call(alloc, vec![size])[0];
+        let page = b.platform_call(grow, vec![size])[0];
 
         let answer = b.constant(Word, 42);
         let decoy = b.constant(Word, 7);
@@ -186,11 +214,11 @@ fn uses_the_heap() -> Program {
 /// `(first == 200) + second`, so both have to hold to reach 8.
 fn stores_a_byte() -> Program {
     let (mut program, main) = Program::new("main");
-    let alloc = program.platform("alloc", vec![Word], vec![Class::Address]);
+    let grow = program.platform("grow", vec![Word], vec![Class::Address]);
 
     program.define(main, |b, _| {
         let size = b.constant(Word, 4096);
-        let page = b.platform_call(alloc, vec![size])[0];
+        let page = b.platform_call(grow, vec![size])[0];
 
         let high = b.constant(Word, 200);
         b.store(Width::Byte, page, Offset::Bytes(0), high);
@@ -202,6 +230,22 @@ fn stores_a_byte() -> Program {
         let expected = b.constant(Word, 200);
         let intact = b.compare(Relation::Equal, first, expected);
         Terminator::Return(vec![b.binary(Binary::Add, intact, second)])
+    });
+    program
+}
+
+/// `Fixed { bits: 8 }` is arithmetic in Z/256, so 250 + 10 is 4 on every
+/// target: free on a machine with eight-bit registers, a mask on the two
+/// that are wider.
+fn wraps_at_eight_bits() -> Program {
+    let byte = Class::Fixed { bits: 8 };
+    let (mut program, main) = Program::new("main");
+    program.define(main, |b, _| {
+        let left = b.constant(byte, 250);
+        let right = b.constant(byte, 10);
+        let sum = b.binary(Binary::Add, left, right);
+        // The entry returns a word, and this is where the width changes.
+        Terminator::Return(vec![b.convert(Word, sum)])
     });
     program
 }
@@ -261,7 +305,10 @@ fn status(target: Target, program: &Program) -> i32 {
     execute(target, program).0
 }
 
-/// Compile, write, execute. Returns what the program printed and how big it
+/// Compile, write, execute. Every program is validated first, since a class
+/// disagreement is the kind of thing a target miscompiles in silence.
+///
+/// Returns what the program printed and how big it
 /// was, so a test can pin both.
 ///
 /// Serialised because the two halves race: another thread forking for its own
@@ -275,6 +322,8 @@ fn run(target: Target, program: &Program) -> (String, usize) {
 
 fn execute(target: Target, program: &Program) -> (i32, String, usize) {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    faun::ir::validate(program).expect("a well-formed program");
     let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
 
     let dir = std::env::temp_dir().join(format!(
@@ -292,6 +341,7 @@ fn execute(target: Target, program: &Program) -> (i32, String, usize) {
     let output = match target {
         Target::X86_64Linux => Command::new(&path).output().unwrap(),
         Target::Wasm32Wasi => Command::new("wasmtime").arg(&path).output().unwrap(),
+        Target::Mos6502Sim65 => Command::new("sim65").arg(&path).output().unwrap(),
     };
     let size = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
     fs::remove_dir_all(&dir).unwrap();

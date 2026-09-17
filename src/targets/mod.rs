@@ -8,6 +8,7 @@
 //!   through scratch.
 
 pub(crate) mod bytes;
+pub mod mos6502_sim65;
 pub mod wasm32_wasi;
 pub mod x86_64_linux;
 
@@ -28,10 +29,11 @@ pub struct Artifact {
 pub enum Target {
     X86_64Linux,
     Wasm32Wasi,
+    Mos6502Sim65,
 }
 
 impl Target {
-    pub const ALL: [Self; 2] = [Self::X86_64Linux, Self::Wasm32Wasi];
+    pub const ALL: [Self; 3] = [Self::X86_64Linux, Self::Wasm32Wasi, Self::Mos6502Sim65];
 
     /// The target native to the machine the compiler is running on, if there
     /// is a backend for it. `None` means `--target` is not optional here.
@@ -46,6 +48,7 @@ impl Target {
         match self {
             Self::X86_64Linux => "x86_64-linux",
             Self::Wasm32Wasi => "wasm32-wasi",
+            Self::Mos6502Sim65 => "mos6502-sim65",
         }
     }
 
@@ -59,6 +62,7 @@ impl Target {
         match self {
             Self::X86_64Linux => x86_64_linux::emit(program),
             Self::Wasm32Wasi => wasm32_wasi::emit(program),
+            Self::Mos6502Sim65 => mos6502_sim65::emit(program),
         }
     }
 }

@@ -49,6 +49,7 @@
               rust-analyzer
               rustfmt
               wasmtime
+              cc65
               dprint
               fd
               ripgrep

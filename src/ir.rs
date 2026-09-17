@@ -32,6 +32,12 @@ pub struct ValueId(pub usize);
 pub enum Class {
     /// As wide as an address, whatever the target's is.
     Word,
+    /// Arithmetic in Z/2^bits: wrapping is the meaning, not an overflow a
+    /// target may or may not have. One wider than `bits` narrows after each
+    /// operation, and one narrower synthesizes.
+    Fixed {
+        bits: u16,
+    },
     Address,
 }
 
@@ -97,6 +103,13 @@ pub enum Op {
         width: Width,
         address: ValueId,
         offset: Offset,
+        value: ValueId,
+    },
+    /// `value` read as `class`, which is the only place a width changes.
+    /// Everything else works at the width its operands already have, so a
+    /// target need not normalise after each operation.
+    Convert {
+        class: Class,
         value: ValueId,
     },
     PlatformCall {
@@ -283,6 +296,16 @@ impl Program {
     }
 }
 
+/// A value taken modulo its class, which for [`Class::Fixed`] is the only
+/// reading there is.
+#[must_use]
+pub const fn wrap(class: Class, value: u64) -> u64 {
+    match class {
+        Class::Fixed { bits } if bits < 64 => value & ((1 << bits) - 1),
+        _ => value,
+    }
+}
+
 #[derive(Debug)]
 pub struct Builder<'a> {
     program: &'a mut Program,
@@ -292,6 +315,7 @@ pub struct Builder<'a> {
 
 impl Builder<'_> {
     pub fn constant(&mut self, class: Class, value: u64) -> ValueId {
+        let value = wrap(class, value);
         self.push(Op::Constant { class, value }, vec![class])[0]
     }
 
@@ -340,6 +364,10 @@ impl Builder<'_> {
             value,
         };
         self.push(op, Vec::new());
+    }
+
+    pub fn convert(&mut self, class: Class, value: ValueId) -> ValueId {
+        self.push(Op::Convert { class, value }, vec![class])[0]
     }
 
     pub fn platform_call(&mut self, platform: PlatformId, args: Vec<ValueId>) -> Vec<ValueId> {
@@ -417,5 +445,98 @@ impl Builder<'_> {
             instructions: self.instructions,
             terminator,
         }
+    }
+}
+
+/// What a program has to be true of before a target sees it. These are the
+/// mistakes a builder can make that a target would otherwise miscompile in
+/// silence rather than reject.
+///
+/// # Errors
+///
+/// Names the first disagreement found.
+pub fn validate(program: &Program) -> Result<(), String> {
+    for function in &program.functions {
+        check(program, function, &function.body, &function.returns)?;
+    }
+    Ok(())
+}
+
+fn check(
+    program: &Program,
+    function: &Function,
+    region: &Region,
+    returns: &[Class],
+) -> Result<(), String> {
+    let name = &function.name;
+    for instruction in &region.instructions {
+        match &instruction.op {
+            Op::Binary { left, right, .. } | Op::Compare { left, right, .. } => {
+                let (left, right) = (program.class(*left), program.class(*right));
+                if left != right {
+                    return Err(format!("{name}: {left:?} and {right:?} in one operation"));
+                }
+            }
+            Op::If {
+                then_region,
+                else_region,
+                ..
+            } => {
+                check(program, function, then_region, returns)?;
+                check(program, function, else_region, returns)?;
+            }
+            Op::Loop { body, .. } => check(program, function, body, returns)?,
+            _ => {}
+        }
+    }
+
+    if let Terminator::Return(values) = &region.terminator {
+        let found: Vec<_> = values.iter().map(|&v| program.class(v)).collect();
+        if found != returns {
+            return Err(format!(
+                "{name} returns {returns:?} but leaves with {found:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mistake `Convert` exists to make visible: an entry that says it
+    /// leaves with a word, leaving with eight bits instead.
+    #[test]
+    fn a_width_that_changes_without_saying_so_is_rejected() {
+        let (mut program, main) = Program::new("main");
+        program.define(main, |b, _| {
+            let byte = b.constant(Class::Fixed { bits: 8 }, 250);
+            Terminator::Return(vec![byte])
+        });
+
+        let error = validate(&program).unwrap_err();
+        assert!(error.contains("main returns"), "{error}");
+
+        let (mut program, main) = Program::new("main");
+        program.define(main, |b, _| {
+            let byte = b.constant(Class::Fixed { bits: 8 }, 250);
+            Terminator::Return(vec![b.convert(Class::Word, byte)])
+        });
+        assert!(validate(&program).is_ok());
+    }
+
+    #[test]
+    fn operands_of_one_operation_must_agree() {
+        let (mut program, main) = Program::new("main");
+        program.define(main, |b, _| {
+            let byte = b.constant(Class::Fixed { bits: 8 }, 1);
+            let word = b.constant(Class::Word, 1);
+            let sum = b.binary(Binary::Add, byte, word);
+            Terminator::Return(vec![b.convert(Class::Word, sum)])
+        });
+
+        let error = validate(&program).unwrap_err();
+        assert!(error.contains("in one operation"), "{error}");
     }
 }
