@@ -1,3 +1,5 @@
+pub mod barb;
+mod index;
 pub mod ir;
 pub mod targets;
 
