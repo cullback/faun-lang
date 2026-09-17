@@ -1,6 +1,22 @@
 [package]
-name = "faun-lang"
+name = "faun"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bpaf = "0.9"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

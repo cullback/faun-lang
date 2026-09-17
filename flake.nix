@@ -48,6 +48,7 @@
               clippy
               rust-analyzer
               rustfmt
+              wasmtime
               dprint
               fd
               ripgrep

@@ -3,5 +3,14 @@
 version = 4
 
 [[package]]
-name = "faun-lang"
+name = "bpaf"
+version = "0.9.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597e81e56404b7a3e26ef7b449f82a4b7a661ae76c3cac692b42d6bad06a0fbe"
+
+[[package]]
+name = "faun"
 version = "0.1.0"
+dependencies = [
+ "bpaf",
+]

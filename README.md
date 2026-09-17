@@ -1,3 +1,3 @@
 # Faun
 
-A statically typed functional programming language.
+A work-in-progress compiled, statically typed, functional programming language.
