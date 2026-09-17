@@ -40,6 +40,11 @@ const ARGS: u8 = 0x0E;
 const ARG_COUNT: u8 = 4;
 /// The bump allocator's cursor, set at reset to the end of the image.
 const HEAP: u8 = 0x16;
+/// Zero-page pairs a function may keep its most used values in, rather than
+/// reaching them through `FP`. Each costs the function saving and restoring
+/// it around calls, so the count is modest.
+const HOMES: u8 = 0x18;
+const HOME_COUNT: u8 = 16;
 
 /// The simulator's hooks: a `jmp` or `jsr` to one is answered by the host.
 const HOOK_WRITE: u16 = 0xFFF7;

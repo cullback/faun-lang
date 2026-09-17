@@ -10,12 +10,47 @@ use faun::ir::Class::Word;
 use faun::ir::{Binary, Class, Offset, Program, Relation, Width};
 use faun::targets::Target;
 
+/// What the smallest programs compile to, for every target. Ratchets: lower
+/// one when a target improves, and do not raise one without saying why.
+#[test]
+fn minimal_programs_compile_to_the_sizes_recorded_for_them() {
+    use Target::{Mos6502Sim65, Wasm32Wasi, X86_64Linux};
+    for (name, program, sizes) in [
+        (
+            "empty",
+            empty(),
+            [(X86_64Linux, 127), (Wasm32Wasi, 39), (Mos6502Sim65, 30)],
+        ),
+        (
+            "two and two",
+            two_and_two(),
+            [(X86_64Linux, 136), (Wasm32Wasi, 105), (Mos6502Sim65, 45)],
+        ),
+        (
+            "hello world",
+            faun::hello_world(),
+            [(X86_64Linux, 158), (Wasm32Wasi, 141), (Mos6502Sim65, 63)],
+        ),
+    ] {
+        for (target, size) in sizes {
+            let bytes = faun::compile(target, &program)[0].bytes.len();
+            assert_eq!(bytes, size, "{name} for {target}");
+        }
+    }
+}
+
+#[test]
+fn every_target_adds_two_and_two() {
+    for target in Target::ALL {
+        assert_eq!(status(target, &two_and_two()), 4, "{target}");
+    }
+}
+
 #[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn the_x86_64_linux_executable_prints_hello_world() {
-    let (output, bytes) = run(Target::X86_64Linux, &faun::hello_world());
+    let (output, _) = run(Target::X86_64Linux, &faun::hello_world());
     assert_eq!(output, "Hello, World!\n");
-    assert_eq!(bytes, 158, "the executable changed size");
 }
 
 #[test]
@@ -51,30 +86,43 @@ fn the_mos6502_image_runs_every_program() {
     );
     assert_eq!(status(Target::Mos6502Sim65, &uses_the_heap()), 42);
     assert_eq!(status(Target::Mos6502Sim65, &stores_a_byte()), 8);
+    assert_eq!(run(Target::Mos6502Sim65, &writes_from_the_heap()).0, "hi\n");
+    assert_eq!(status(Target::Mos6502Sim65, &values_survive_a_call()), 45);
+}
+
+#[test]
+fn every_target_hands_back_what_a_call_would_destroy() {
+    for target in Target::ALL {
+        assert_eq!(status(target, &values_survive_a_call()), 45, "{target}");
+    }
+}
+
+#[test]
+fn every_target_writes_from_the_heap() {
+    for target in Target::ALL {
+        assert_eq!(run(target, &writes_from_the_heap()).0, "hi\n", "{target}");
+    }
 }
 
 #[test]
 fn the_wasm32_wasi_module_prints_hello_world() {
-    let (output, bytes) = run(Target::Wasm32Wasi, &faun::hello_world());
+    let (output, _) = run(Target::Wasm32Wasi, &faun::hello_world());
     assert_eq!(output, "Hello, World!\n");
-    assert_eq!(bytes, 141, "the module changed size");
 }
 
 #[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn the_smallest_x86_64_linux_executable_is_headers_and_an_exit() {
-    let (output, bytes) = run(Target::X86_64Linux, &empty());
-    assert_eq!(output, "");
     // 120 bytes of header, then `push 60; pop rax; xor edi, edi; syscall`.
-    assert_eq!(bytes, 127);
+    let (output, _) = run(Target::X86_64Linux, &empty());
+    assert_eq!(output, "");
 }
 
 #[test]
 fn the_smallest_wasm32_wasi_module_imports_nothing() {
-    let (output, bytes) = run(Target::Wasm32Wasi, &empty());
-    assert_eq!(output, "");
     // Type, function, export, code. No imports, no memory, no data.
-    assert_eq!(bytes, 39);
+    let (output, _) = run(Target::Wasm32Wasi, &empty());
+    assert_eq!(output, "");
 }
 
 #[test]
@@ -141,6 +189,16 @@ fn empty() -> Program {
     program.define(main, |b, _| {
         let status = b.constant(Word, 0);
         b.ret(&[status])
+    });
+    program
+}
+
+fn two_and_two() -> Program {
+    let (mut program, main) = Program::new("main");
+    program.define(main, |b, _| {
+        let two = b.constant(Word, 2);
+        let sum = b.binary(Binary::Add, two, two);
+        b.ret(&[sum])
     });
     program
 }
@@ -216,6 +274,76 @@ fn uses_the_heap() -> Program {
 
         let answer = b.load(Width::Word, page, Offset::Words(1));
         b.ret(&[answer])
+    });
+    program
+}
+
+/// Several values still wanted after a call, and a callee greedy enough to
+/// take every pair it can. Anything the caller fails to hand back shows up
+/// in the answer.
+///
+/// `clobber(x)` is `x + 2` through three intermediates; `outer(10, 3)` is
+/// `13 + 7 + 12 + 10 + 3`.
+fn values_survive_a_call() -> Program {
+    let (mut program, main) = Program::new("main");
+    let clobber = program.declare("clobber", &[Word], vec![Word]);
+    let outer = program.declare("outer", &[Word, Word], vec![Word]);
+
+    program.define(clobber, |b, params| {
+        let x = params[0];
+        let one = b.constant(Word, 1);
+        let two = b.constant(Word, 2);
+        let three = b.constant(Word, 3);
+        let up = b.binary(Binary::Add, x, one);
+        let down = b.binary(Binary::Sub, up, two);
+        let back = b.binary(Binary::Add, down, three);
+        b.ret(&[back])
+    });
+
+    program.define(outer, |b, params| {
+        let (a, second) = (params[0], params[1]);
+        let p = b.binary(Binary::Add, a, second);
+        let q = b.binary(Binary::Sub, a, second);
+        let r = b.call(clobber, &[a])[0];
+        // Every one of these was computed before the call.
+        let total = b.binary(Binary::Add, p, q);
+        let total = b.binary(Binary::Add, total, r);
+        let total = b.binary(Binary::Add, total, a);
+        let total = b.binary(Binary::Add, total, second);
+        b.ret(&[total])
+    });
+
+    program.define(main, |b, _| {
+        let ten = b.constant(Word, 10);
+        let three = b.constant(Word, 3);
+        let answer = b.call(outer, &[ten, three]);
+        b.ret(&answer)
+    });
+    program
+}
+
+/// Writes through an address the program worked out for itself, which is
+/// the case a target cannot answer with a block of constants.
+fn writes_from_the_heap() -> Program {
+    let (mut program, main) = Program::new("main");
+    let grow = program.platform("grow", vec![Word], vec![Class::Address]);
+    let write = program.platform("write", vec![Class::Address, Word], Vec::new());
+
+    program.define(main, |b, _| {
+        let size = b.constant(Word, 4096);
+        let page = b.platform_call(grow, &[size])[0];
+
+        // "hi\n", a byte at a time, since the bytes are computed too.
+        for (index, byte) in [b'h', b'i', b'\n'].into_iter().enumerate() {
+            let value = b.constant(Word, u64::from(byte));
+            let offset = Offset::Bytes(i32::try_from(index).expect("a short greeting"));
+            b.store(Width::Byte, page, offset, value);
+        }
+
+        let length = b.constant(Word, 3);
+        b.platform_call(write, &[page, length]);
+        let status = b.constant(Word, 0);
+        b.ret(&[status])
     });
     program
 }

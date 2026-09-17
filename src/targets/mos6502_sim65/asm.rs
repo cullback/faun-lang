@@ -15,6 +15,7 @@ pub(super) enum Cc {
     Equal,
     NotEqual,
     NoCarry,
+    Carry,
 }
 
 impl Cc {
@@ -24,6 +25,7 @@ impl Cc {
             Self::Equal => 0xF0,    // beq
             Self::NotEqual => 0xD0, // bne
             Self::NoCarry => 0x90,  // bcc
+            Self::Carry => 0xB0,    // bcs
         }
     }
 
@@ -33,6 +35,7 @@ impl Cc {
             Self::Equal => 0xD0,
             Self::NotEqual => 0xF0,
             Self::NoCarry => 0xB0,
+            Self::Carry => 0x90,
         }
     }
 }
@@ -47,6 +50,8 @@ pub(super) struct Assembler {
     /// The same for the one-byte holes a relative branch leaves, with the
     /// branch's number so the caller can lengthen it.
     near: Vec<(usize, Label, usize)>,
+    /// One-byte holes wanting half of a label's address, and which half.
+    halves: Vec<(usize, Label, bool)>,
     /// Which branches, by number, have already been found not to reach.
     far: Vec<bool>,
     branches: usize,
@@ -83,6 +88,12 @@ impl Assembler {
             self.bytes[at..at + 2].copy_from_slice(&target.to_le_bytes());
         }
 
+        for (at, label, high) in std::mem::take(&mut self.halves) {
+            let target = self.labels[label.0].expect("every label is bound");
+            let [low, high_byte] = target.to_le_bytes();
+            self.bytes[at] = if high { high_byte } else { low };
+        }
+
         let mut overflowed = Vec::new();
         for (at, label, branch) in std::mem::take(&mut self.near) {
             let target = self.labels[label.0].expect("every label is bound");
@@ -101,6 +112,18 @@ impl Assembler {
 
     pub(super) fn lda_imm(&mut self, value: u8) {
         self.emit(&[0xA9, value]);
+    }
+
+    /// Half of a label's address, as an immediate.
+    pub(super) fn lda_imm_half(&mut self, label: Label, high: bool) {
+        self.emit(&[0xA9]);
+        self.halves.push((self.bytes.len(), label, high));
+        self.emit(&[0]);
+    }
+
+    /// A literal word, for data the target lays down itself.
+    pub(super) fn word(&mut self, value: u16) {
+        self.emit(&value.to_le_bytes());
     }
 
     pub(super) fn lda_zp(&mut self, at: u8) {
@@ -165,6 +188,18 @@ impl Assembler {
 
     pub(super) fn sbc_imm(&mut self, value: u8) {
         self.emit(&[0xE9, value]);
+    }
+
+    pub(super) fn cmp_imm(&mut self, value: u8) {
+        self.emit(&[0xC9, value]);
+    }
+
+    pub(super) fn inc_zp(&mut self, at: u8) {
+        self.emit(&[0xE6, at]);
+    }
+
+    pub(super) fn dec_zp(&mut self, at: u8) {
+        self.emit(&[0xC6, at]);
     }
 
     pub(super) fn cmp_zp(&mut self, at: u8) {
