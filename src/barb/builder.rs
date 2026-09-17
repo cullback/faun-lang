@@ -19,9 +19,10 @@ impl Program {
 
     /// The symbol for `name`, the same symbol every time.
     ///
-    /// A scan rather than a table beside it: only declarations are named, so
-    /// there are as many of these as a program has types, constructors and
-    /// functions, and a program stays a plain bag of pools.
+    /// A scan rather than a table beside it. This runs once per declaration
+    /// and nowhere else: nothing here mints a name, since specialisation
+    /// happens above this tier, so the cost is over what a program declares
+    /// rather than over its terms. Reading one back is an index and a slice.
     ///
     /// # Panics
     ///
