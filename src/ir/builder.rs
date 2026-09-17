@@ -1,0 +1,300 @@
+//! Building well-shaped programs.
+
+use super::model::{
+    Binary, Class, DataId, Exit, Function, FunctionId, Offset, Op, Operands, Origin, Platform,
+    PlatformId, Program, Region, RegionId, Relation, Span, Terminator, ValueId, Width, wrap,
+};
+
+impl Program {
+    /// A program and its entry function, which takes nothing and returns one
+    /// word, the exit status. Minting it here is what makes a program without
+    /// an entry unrepresentable.
+    #[must_use]
+    pub fn new(entry: &str) -> (Self, FunctionId) {
+        let mut program = Self {
+            platform: Vec::new(),
+            data: Vec::new(),
+            globals: Vec::new(),
+            spans: Vec::new(),
+            functions: Vec::new(),
+            classes: Vec::new(),
+            ops: Vec::new(),
+            results: Vec::new(),
+            operands: Vec::new(),
+            regions: Vec::new(),
+        };
+        let entry = program.declare(entry, &[], vec![Class::Word]);
+        (program, entry)
+    }
+
+    /// # Panics
+    ///
+    /// If the program's data outgrows the 4 GiB a target can address.
+    pub fn intern(&mut self, bytes: &[u8]) -> DataId {
+        Self::place(&mut self.data, &mut self.spans, Origin::Data, bytes)
+    }
+
+    /// The same, for a datum the program writes to. Its initial contents are
+    /// in the image, so a counter starting at zero is eight zero bytes.
+    ///
+    /// # Panics
+    ///
+    /// If the program's data outgrows the 4 GiB a target can address.
+    pub fn global(&mut self, bytes: &[u8]) -> DataId {
+        Self::place(&mut self.globals, &mut self.spans, Origin::Globals, bytes)
+    }
+
+    fn place(blob: &mut Vec<u8>, spans: &mut Vec<Span>, origin: Origin, bytes: &[u8]) -> DataId {
+        let start = u32::try_from(blob.len()).expect("data within 4 GiB");
+        let len = u32::try_from(bytes.len()).expect("a datum within 4 GiB");
+        blob.extend_from_slice(bytes);
+        spans.push(Span { origin, start, len });
+        DataId::at(spans.len() - 1)
+    }
+
+    pub fn platform(&mut self, name: &str, params: Vec<Class>, returns: Vec<Class>) -> PlatformId {
+        self.platform.push(Platform {
+            name: name.to_owned(),
+            params,
+            returns,
+        });
+        PlatformId::at(self.platform.len() - 1)
+    }
+
+    /// Separate from defining, so a body may call a function declared after
+    /// it, or itself.
+    pub fn declare(&mut self, name: &str, params: &[Class], returns: Vec<Class>) -> FunctionId {
+        let params = self.mint(params);
+        self.regions.push(Region {
+            params: Operands::default(),
+            ops: Operands::default(),
+            terminator: Terminator::UNREACHABLE,
+        });
+        self.functions.push(Function {
+            name: name.to_owned(),
+            params,
+            returns,
+            body: RegionId::at(self.regions.len() - 1),
+        });
+        FunctionId::at(self.functions.len() - 1)
+    }
+
+    pub fn define(
+        &mut self,
+        function: FunctionId,
+        build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
+    ) {
+        let entry = self.functions[function.index()].params;
+        let body = self.functions[function.index()].body;
+        let params: Vec<_> = self.values(entry).to_vec();
+
+        let mut builder = Builder {
+            program: self,
+            params: entry,
+            ops: Vec::new(),
+            results: Vec::new(),
+        };
+        let terminator = build(&mut builder, &params);
+        let region = builder.finish(terminator);
+        self.regions[body.index()] = region;
+    }
+
+    /// Mint one value per class, and give back the run they occupy.
+    fn mint(&mut self, classes: &[Class]) -> Operands {
+        let start = u32::try_from(self.operands.len()).expect("a program within 4G operands");
+        for &class in classes {
+            self.classes.push(class);
+            self.operands.push(ValueId::at(self.classes.len() - 1));
+        }
+        Operands {
+            start,
+            len: u32::try_from(classes.len()).expect("a sane arity"),
+        }
+    }
+}
+
+/// Accumulates one region.
+///
+/// Its instructions are appended to the program only when the region is
+/// finished, which is what keeps a region's run of them contiguous while
+/// nested regions are being built inside it.
+#[derive(Debug)]
+pub struct Builder<'a> {
+    program: &'a mut Program,
+    params: Operands,
+    ops: Vec<Op>,
+    results: Vec<Operands>,
+}
+
+impl Builder<'_> {
+    pub fn constant(&mut self, class: Class, value: u64) -> ValueId {
+        let value = wrap(class, value);
+        self.push(Op::Constant { class, value }, &[class])[0]
+    }
+
+    /// The same word, written the way a negative number reads.
+    pub fn constant_signed(&mut self, class: Class, value: i64) -> ValueId {
+        self.constant(class, value.cast_unsigned())
+    }
+
+    pub fn address_of(&mut self, data: DataId) -> ValueId {
+        self.push(Op::AddressOf(data), &[Class::Address])[0]
+    }
+
+    pub fn data_len(&mut self, data: DataId) -> ValueId {
+        let len = self.program.datum(data).len;
+        self.constant(Class::Word, u64::from(len))
+    }
+
+    pub fn binary(&mut self, op: Binary, left: ValueId, right: ValueId) -> ValueId {
+        let class = self.program.class(left);
+        self.push(Op::Binary { op, left, right }, &[class])[0]
+    }
+
+    pub fn compare(&mut self, relation: Relation, left: ValueId, right: ValueId) -> ValueId {
+        let op = Op::Compare {
+            relation,
+            left,
+            right,
+        };
+        self.push(op, &[Class::Word])[0]
+    }
+
+    pub fn load(&mut self, width: Width, address: ValueId, offset: Offset) -> ValueId {
+        let op = Op::Load {
+            width,
+            address,
+            offset,
+        };
+        self.push(op, &[Class::Word])[0]
+    }
+
+    pub fn store(&mut self, width: Width, address: ValueId, offset: Offset, value: ValueId) {
+        let op = Op::Store {
+            width,
+            address,
+            offset,
+            value,
+        };
+        self.push(op, &[]);
+    }
+
+    pub fn convert(&mut self, class: Class, value: ValueId) -> ValueId {
+        self.push(Op::Convert { class, value }, &[class])[0]
+    }
+
+    pub fn platform_call(&mut self, platform: PlatformId, args: &[ValueId]) -> Vec<ValueId> {
+        let returns = self.program.platform[platform.index()].returns.clone();
+        let args = self.program.hold(args);
+        self.push(Op::PlatformCall { platform, args }, &returns)
+    }
+
+    pub fn call(&mut self, function: FunctionId, args: &[ValueId]) -> Vec<ValueId> {
+        let returns = self.program.functions[function.index()].returns.clone();
+        let args = self.program.hold(args);
+        self.push(Op::Call { function, args }, &returns)
+    }
+
+    pub fn if_(
+        &mut self,
+        condition: ValueId,
+        results: &[Class],
+        then: impl FnOnce(&mut Builder) -> Terminator,
+        otherwise: impl FnOnce(&mut Builder) -> Terminator,
+    ) -> Vec<ValueId> {
+        let then_region = self.region(&[], |builder, _| then(builder));
+        let else_region = self.region(&[], |builder, _| otherwise(builder));
+        let op = Op::If {
+            condition,
+            then_region,
+            else_region,
+        };
+        self.push(op, results)
+    }
+
+    /// The body runs with `initial`, then with whatever each `Continue`
+    /// carries. `results` are the classes a `Break` leaves with.
+    pub fn loop_(
+        &mut self,
+        initial: &[ValueId],
+        results: &[Class],
+        build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
+    ) -> Vec<ValueId> {
+        let classes: Vec<_> = initial
+            .iter()
+            .map(|&value| self.program.class(value))
+            .collect();
+        let body = self.region(&classes, build);
+        let initial = self.program.hold(initial);
+        self.push(Op::Loop { initial, body }, results)
+    }
+
+    // The exits, which have to intern the values they carry.
+
+    pub fn ret(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Return, values)
+    }
+
+    pub fn yield_(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Yield, values)
+    }
+
+    pub fn continue_(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Continue, values)
+    }
+
+    pub fn break_(&mut self, values: &[ValueId]) -> Terminator {
+        self.exit(Exit::Break, values)
+    }
+
+    fn exit(&mut self, exit: Exit, values: &[ValueId]) -> Terminator {
+        Terminator {
+            exit,
+            values: self.program.hold(values),
+        }
+    }
+
+    fn region(
+        &mut self,
+        params: &[Class],
+        build: impl FnOnce(&mut Builder, &[ValueId]) -> Terminator,
+    ) -> RegionId {
+        let entry = self.program.mint(params);
+        let params: Vec<_> = self.program.values(entry).to_vec();
+
+        let mut builder = Builder {
+            program: self.program,
+            params: entry,
+            ops: Vec::new(),
+            results: Vec::new(),
+        };
+        let terminator = build(&mut builder, &params);
+        let region = builder.finish(terminator);
+
+        self.program.regions.push(region);
+        RegionId::at(self.program.regions.len() - 1)
+    }
+
+    fn push(&mut self, op: Op, classes: &[Class]) -> Vec<ValueId> {
+        let results = self.program.mint(classes);
+        let values = self.program.values(results).to_vec();
+        self.ops.push(op);
+        self.results.push(results);
+        values
+    }
+
+    /// Append this region's instructions to the program, where they become
+    /// one contiguous run.
+    fn finish(self, terminator: Terminator) -> Region {
+        let start = u32::try_from(self.program.ops.len()).expect("a program within 4G ops");
+        let len = u32::try_from(self.ops.len()).expect("a region within 4G ops");
+        self.program.ops.extend_from_slice(&self.ops);
+        self.program.results.extend_from_slice(&self.results);
+
+        Region {
+            params: self.params,
+            ops: Operands { start, len },
+            terminator,
+        }
+    }
+}
