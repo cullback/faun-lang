@@ -92,8 +92,6 @@ pub struct Function {
     /// The types of its parameters, which are the first locals.
     pub params: Range,
     pub result: TypeId,
-    /// How many locals the body binds, parameters included.
-    pub locals: u32,
     pub body: ExprId,
 }
 
@@ -117,6 +115,37 @@ pub struct Program {
 }
 
 impl Program {
+    /// How many locals a body binds, parameters included: the deepest chain
+    /// of binders in it, since sibling arms take the same levels back and a
+    /// `let`'s value is bound outside its own binding.
+    ///
+    /// # Panics
+    ///
+    /// If a constructor outgrew the fields it may have.
+    #[must_use]
+    pub fn locals(&self, id: FnId) -> u32 {
+        fn deepest(program: &Program, expr: ExprId, at: u32) -> u32 {
+            match program.expr(expr) {
+                Expr::Let(value, body) => {
+                    deepest(program, value, at).max(deepest(program, body, at + 1))
+                }
+                Expr::Match(_, arms) => program
+                    .arms(arms)
+                    .iter()
+                    .map(|arm| {
+                        let bound = u32::try_from(program.fields(arm.ctor).len())
+                            .expect("a sane constructor arity");
+                        deepest(program, arm.body, at + bound)
+                    })
+                    .max()
+                    .unwrap_or(at),
+                _ => at,
+            }
+        }
+        let params = u32::try_from(self.params(id).len()).expect("a sane arity");
+        deepest(self, self.function(id).body, params)
+    }
+
     #[must_use]
     pub fn type_(&self, id: TypeId) -> &Type {
         &self.types[id.index()]

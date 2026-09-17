@@ -159,10 +159,10 @@ fn the_builder_writes_the_lets_itself() {
         })
     });
 
-    // Two parameters, then `k` in the recursive arm and the call and the
-    // constructor inside it. The match itself binds nothing: it is the body,
-    // so `close` used it rather than wrapping it in a `let`.
-    assert_eq!(program.function(add).locals, 5);
+    // Two parameters, `k` in the recursive arm, and the call bound inside it.
+    // Neither the constructor nor the match binds anything: each is the body
+    // of its scope, so `close` used it rather than wrapping it in a `let`.
+    assert_eq!(program.locals(add), 4);
     let Expr::Match(scrutinee, arms) = program.expr(program.function(add).body) else {
         panic!("the body is the match itself, with no `let` around it");
     };

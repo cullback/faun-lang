@@ -55,7 +55,6 @@ impl Program {
             name: name.to_owned(),
             params: Range::of(at, params.len()),
             result,
-            locals: u32::try_from(params.len()).expect("a sane arity"),
             body: ExprId(0),
         });
         FnId::at(self.functions.len() - 1)
@@ -141,12 +140,9 @@ impl Program {
             program: self,
             pending: Vec::new(),
             level: 0,
-            high: arity,
         };
         let body = builder.scope(arity, build);
-        let locals = builder.high;
         self.functions[id.index()].body = body;
-        self.functions[id.index()].locals = locals;
     }
 }
 
@@ -161,7 +157,6 @@ pub struct Builder<'a> {
     program: &'a mut Program,
     pending: Vec<ExprId>,
     level: u32,
-    high: u32,
 }
 
 impl Builder<'_> {
@@ -218,7 +213,6 @@ impl Builder<'_> {
         self.pending.push(id);
         let bound = Atom(Local(self.level));
         self.level += 1;
-        self.high = self.high.max(self.level);
         bound
     }
 
@@ -228,7 +222,6 @@ impl Builder<'_> {
         let level = self.level;
         let binders: Vec<Atom> = (0..bound).map(|at| Atom(Local(level + at))).collect();
         self.level = level + bound;
-        self.high = self.high.max(self.level);
 
         let result = build(self, &binders);
         let body = self.close(result);
