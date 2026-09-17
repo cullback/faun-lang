@@ -20,61 +20,91 @@ const WASI: &str = "wasi_snapshot_preview1";
 const PAGE_SIZE: u32 = 65536;
 
 pub(super) fn module(code: &Code) -> Vec<u8> {
-    // Imports come first in both index spaces, so `imports` is also the
+    // Imports come first in both index spaces, so their count is also the
     // index of the one function this compiler writes, and of its type.
-    let imports = 1 + u32::from(code.imports_proc_exit);
+    let start = len32(code.imports.len());
     let mut out = Bytes::default();
     out.bytes(b"\0asm");
     out.bytes(&[1, 0, 0, 0]);
 
+    types(&mut out, &code.imports);
+    out.section(IMPORT, |s| {
+        s.uleb(start);
+        for (index, name) in code.imports.iter().enumerate() {
+            s.name(WASI);
+            s.name(name);
+            s.byte(KIND_FUNC);
+            s.uleb(len32(index));
+        }
+    });
+    out.section(FUNCTION, |s| {
+        s.uleb(1);
+        s.uleb(start);
+    });
+    if code.memory {
+        out.section(MEMORY, |s| {
+            s.uleb(1);
+            s.byte(0x00);
+            s.uleb(pages(code));
+        });
+    }
+    exports(&mut out, code.memory, start);
+    body(&mut out, code);
+    data(&mut out, code);
+
+    out.finish()
+}
+
+/// One signature per imported function, then `_start`.
+fn types(out: &mut Bytes, imports: &[&str]) {
     out.section(TYPE, |s| {
-        s.uleb(imports + 1);
-        signature(s, 4, true); // fd_write(fd, iovs, iovs_len, nwritten)
-        if code.imports_proc_exit {
-            signature(s, 1, false); // proc_exit(status)
+        s.uleb(len32(imports.len()) + 1);
+        for name in imports {
+            let (params, returns) = match *name {
+                "fd_write" => (4, true),   // (fd, iovs, iovs_len, nwritten)
+                "proc_exit" => (1, false), // (status)
+                other => panic!("no signature for `{other}`"),
+            };
+            signature(s, params, returns);
         }
         signature(s, 0, false); // _start()
     });
+}
 
-    out.section(IMPORT, |s| {
-        s.uleb(imports);
-        import(s, "fd_write", 0);
-        if code.imports_proc_exit {
-            import(s, "proc_exit", 1);
-        }
-    });
-
-    out.section(FUNCTION, |s| {
-        s.uleb(1);
-        s.uleb(imports);
-    });
-
-    out.section(MEMORY, |s| {
-        s.uleb(1);
-        s.byte(0x00);
-        s.uleb(pages(code));
-    });
-
-    // WASI finds both of these by name.
+/// WASI finds these by name. Memory is only exported when something reads
+/// it, which for a program that prints nothing is never.
+fn exports(out: &mut Bytes, memory: bool, start: u32) {
     out.section(EXPORT, |s| {
-        s.uleb(2);
-        s.name("memory");
-        s.byte(KIND_MEMORY);
-        s.uleb(0);
+        s.uleb(1 + u32::from(memory));
+        if memory {
+            s.name("memory");
+            s.byte(KIND_MEMORY);
+            s.uleb(0);
+        }
         s.name("_start");
         s.byte(KIND_FUNC);
-        s.uleb(imports);
+        s.uleb(start);
     });
+}
 
+/// One function: its locals, the instructions, and the terminating `end`.
+fn body(out: &mut Bytes, code: &Code) {
     out.section(CODE, |s| {
         s.uleb(1);
         s.sized(|f| {
-            f.uleb(0);
+            f.uleb(u32::from(code.locals > 0));
+            if code.locals > 0 {
+                f.uleb(code.locals);
+                f.byte(I32);
+            }
             f.bytes(&code.body);
             f.byte(END);
         });
     });
+}
 
+/// Each region of memory and the constant offset it loads at.
+fn data(out: &mut Bytes, code: &Code) {
     out.section(DATA, |s| {
         if code.data.is_empty() {
             return;
@@ -89,8 +119,6 @@ pub(super) fn module(code: &Code) -> Vec<u8> {
             s.bytes(&segment.bytes);
         }
     });
-
-    out.finish()
 }
 
 fn signature(out: &mut Bytes, params: usize, returns_i32: bool) {
@@ -101,13 +129,6 @@ fn signature(out: &mut Bytes, params: usize, returns_i32: bool) {
     if returns_i32 {
         out.byte(I32);
     }
-}
-
-fn import(out: &mut Bytes, name: &str, type_index: u32) {
-    out.name(WASI);
-    out.name(name);
-    out.byte(KIND_FUNC);
-    out.uleb(type_index);
 }
 
 fn pages(code: &Code) -> u32 {

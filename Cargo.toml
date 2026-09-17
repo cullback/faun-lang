@@ -17,6 +17,8 @@ trivial_numeric_casts = "warn"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+as_conversions = "warn"
+too_many_lines = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"

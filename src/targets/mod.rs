@@ -1,5 +1,11 @@
-//! A target owns everything downstream of the IR: the machine, the
-//! environment it calls into, and the files it writes.
+//! A target owns everything below the IR: the machine, the environment it
+//! calls into, and the files it writes.
+//!
+//! - Targets share [`bytes`] and nothing else.
+//! - Duplication beats an abstraction fitting neither. Their parallel moves
+//!   have no common shape: wasm pushes every source before setting any
+//!   destination and lets its operand stack swap, where x86-64 routes
+//!   through scratch.
 
 pub(crate) mod bytes;
 pub mod wasm32_wasi;

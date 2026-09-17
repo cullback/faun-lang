@@ -26,8 +26,13 @@ pub fn emit(program: &Program) -> Vec<Artifact> {
 struct Code {
     /// Instructions, without the local declarations or the trailing `end`.
     body: Vec<u8>,
+    /// How many `i32` locals `_start` declares.
+    locals: u32,
     data: Vec<Segment>,
-    imports_proc_exit: bool,
+    /// The WASI functions this module calls, in index order. A module that
+    /// calls none imports none, and declares no memory for them to read.
+    imports: Vec<&'static str>,
+    memory: bool,
 }
 
 struct Segment {
