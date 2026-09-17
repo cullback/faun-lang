@@ -536,3 +536,14 @@ fn write(target: Target, output: &Path, program: &Program) -> PathBuf {
 
     path
 }
+
+/// The whole way down: `2 + 2` written in barb, lowered through the machine
+/// tier, compiled, and run. `Nat` is inductive all the way to the lowering,
+/// which is where it becomes a word.
+#[test]
+fn every_target_runs_two_and_two_from_barb() {
+    let machine = faun::ir::lower(&faun::two_and_two()).expect("a representable program");
+    for target in Target::ALL {
+        assert_eq!(status(target, &machine), 4, "{target}");
+    }
+}
