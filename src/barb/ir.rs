@@ -2,6 +2,11 @@
 
 use crate::index::index;
 
+// `Symbol` is a name. The IR never reads the characters of one: names are
+// compared, hashed and copied as integers, and the string is read back only
+// to render it. The table belongs to the program, like every other pool
+// here, so a program is a self-contained value and two of them cannot
+// disagree about what a symbol means.
 index!(ExprId, FnId, TypeId, CtorId, ConstId, Local, Symbol);
 
 /// A run of values in one of the pools beside the arena.
@@ -37,15 +42,6 @@ impl Range {
         start..start + self.len()
     }
 }
-
-/// A name, interned. The IR never reads the characters of one: names are
-/// compared, hashed and copied as integers, and the string is read back only
-/// to render it or to mint a related name.
-///
-/// The table belongs to the program, like every other pool here, so a
-/// program is a self-contained value and two of them cannot disagree about
-/// what a symbol means.
-pub type Name = Symbol;
 
 /// An argument: a local, and nothing else. That is what A-normal form buys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,13 +79,13 @@ pub struct Arm {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Type {
-    pub name: Name,
+    pub name: Symbol,
     pub ctors: Range,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ctor {
-    pub name: Name,
+    pub name: Symbol,
     pub owner: TypeId,
     /// The types of its fields, in order.
     pub fields: Range,
@@ -97,7 +93,7 @@ pub struct Ctor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
-    pub name: Name,
+    pub name: Symbol,
     /// The types of its parameters, which are the first locals.
     pub params: Range,
     pub result: TypeId,
@@ -132,7 +128,7 @@ impl Program {
     ///
     /// If the symbol came from another program.
     #[must_use]
-    pub fn name(&self, symbol: Name) -> &str {
+    pub fn name(&self, symbol: Symbol) -> &str {
         &self.names[symbol.index()]
     }
 

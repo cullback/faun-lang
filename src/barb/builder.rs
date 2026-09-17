@@ -6,8 +6,8 @@
 //! [`ExprId`].
 
 use super::constant;
+use super::ir::Symbol;
 use super::ir::{Arm, Atom, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local};
-use super::ir::{Name, Symbol};
 use super::ir::{Program, Range, Type, TypeId};
 use constant::{Shape, Value};
 
@@ -26,7 +26,7 @@ impl Program {
     /// # Panics
     ///
     /// If the program outgrew the names it may have.
-    pub fn symbol(&mut self, name: &str) -> Name {
+    pub fn symbol(&mut self, name: &str) -> Symbol {
         if let Some(at) = self.names.iter().position(|held| held == name) {
             return Symbol::at(at);
         }
