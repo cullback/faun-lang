@@ -275,18 +275,22 @@ fn addition_is_recognised_and_its_near_miss_is_not() {
 #[test]
 fn a_program_reads_from_text() {
     let program = parse(
-        "type Nat = Zero | Succ(Nat)
+        "type Nat Zero Succ(Nat)
 
          add(a Zero) -> a
          add(a Succ(k)) -> Succ(add(a k))
 
-         main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))",
+         main!(h) -> exit!(h add(Succ(Succ(Zero)) Succ(Succ(Zero))))",
     )
     .expect("a program");
     assert_eq!(
         program.render(),
         "Host = Host
+Unit = Unit
 Nat = Zero | Succ(Nat)
+
+exit!(v0: Host, v1: Nat) -> Unit =
+  <elsewhere>
 
 add(v0: Nat, v1: Nat) -> Nat =
   match v1 {
@@ -297,31 +301,35 @@ add(v0: Nat, v1: Nat) -> Nat =
       Succ(v3)
   }
 
-main() -> Nat =
-  v0 = Zero
-  v1 = Succ(v0)
+main!(v0: Host) -> Unit =
+  v1 = Zero
   v2 = Succ(v1)
-  v3 = Zero
-  v4 = Succ(v3)
+  v3 = Succ(v2)
+  v4 = Zero
   v5 = Succ(v4)
-  add(v2, v5)
+  v6 = Succ(v5)
+  v7 = add(v3, v6)
+  exit!(v0, v7)
 "
     );
 }
 
 #[test]
 fn what_the_surface_will_not_read_it_names() {
-    let two = "type Nat = Zero | Succ(Nat)
+    let two = "type Nat Zero Succ(Nat)
                f(Zero Zero) -> Zero
-               f(a b) -> a";
+               f(a b) -> a
+               main!(h) -> exit!(h f(Zero Zero))";
     assert!(parse(two).unwrap_err().contains("one at a time"));
 
-    let comma = "type Nat = Zero | Succ(Nat)
-                 f(a, b) -> a";
+    let comma = "type Nat Zero Succ(Nat)
+                 f(a, b) -> a
+                 main!(h) -> exit!(h Zero)";
     assert!(parse(comma).unwrap_err().contains("found `,`"));
 
-    let missing = "type Nat = Zero | Succ(Nat)
-                   f(Zero) -> g(Zero)";
+    let missing = "type Nat Zero Succ(Nat)
+                   f(Zero) -> g(Zero)
+                   main!(h) -> exit!(h f(Zero))";
     assert!(parse(missing).unwrap_err().contains("nothing named `g`"));
 }
 
@@ -330,7 +338,7 @@ fn what_the_surface_will_not_read_it_names() {
 #[test]
 fn a_body_works_things_out_on_the_way() {
     let program = parse(
-        "type Nat = Zero | Succ(Nat)
+        "type Nat Zero Succ(Nat)
 
          double(n) ->
            m = add(n n)
@@ -339,16 +347,20 @@ fn a_body_works_things_out_on_the_way() {
          add(a Zero) -> a
          add(a Succ(k)) -> Succ(add(a k))
 
-         main() ->
+         main!(h) ->
            two = Succ(Succ(Zero))
            four = double(two)
-           four",
+           exit!(h four)",
     )
     .expect("a program");
     assert_eq!(
         program.render(),
         "Host = Host
+Unit = Unit
 Nat = Zero | Succ(Nat)
+
+exit!(v0: Host, v1: Nat) -> Unit =
+  <elsewhere>
 
 double(v0: Nat) -> Nat =
   add(v0, v0)
@@ -362,11 +374,64 @@ add(v0: Nat, v1: Nat) -> Nat =
       Succ(v3)
   }
 
-main() -> Nat =
-  v0 = Zero
-  v1 = Succ(v0)
+main!(v0: Host) -> Unit =
+  v1 = Zero
   v2 = Succ(v1)
-  double(v2)
+  v3 = Succ(v2)
+  v4 = double(v3)
+  exit!(v0, v4)
 "
+    );
+}
+
+/// The authority cannot be made, and what an effect answers can: a branch
+/// that does nothing has to answer something, and that is what it answers.
+/// Constructors run until the next declaration, so what ends them is the
+/// lookahead: a name, a parenthesised run, and an arrow is a clause, and
+/// anything else is another constructor. The hard case is a constructor
+/// taking nothing, written last.
+#[test]
+fn constructors_need_nothing_between_them() {
+    let program = parse(
+        "type Nat Succ(Nat) Zero
+         type Pair Both(Nat Nat)
+
+         first(Both(a b)) -> a
+
+         main!(h) -> exit!(h first(Both(Succ(Zero) Zero)))",
+    )
+    .expect("a program");
+    assert!(
+        program.render().starts_with(
+            "Host = Host\nUnit = Unit\nNat = Succ(Nat) | Zero\nPair = Both(Nat, Nat)\n"
+        ),
+        "{}",
+        program.render()
+    );
+}
+
+#[test]
+fn a_program_may_write_unit_and_may_not_write_host() {
+    let refused = parse(
+        "type Nat Zero Succ(Nat)
+         sneak() -> Host
+         main!(h) -> exit!(h Zero)",
+    )
+    .unwrap_err();
+    assert!(refused.contains("`Host` cannot be built"), "{refused}");
+
+    let program = parse(
+        "type Nat Zero Succ(Nat)
+         maybe!(h Zero) -> Unit
+         maybe!(h Succ(k)) -> exit!(h Succ(k))
+         main!(h) -> maybe!(h Succ(Zero))",
+    )
+    .expect("a program");
+    assert!(
+        program
+            .render()
+            .contains("maybe!(v0: Host, v1: Nat) -> Unit"),
+        "{}",
+        program.render()
     );
 }

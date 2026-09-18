@@ -6,13 +6,10 @@
 # every signature that passes it along.
 #
 # The `!` says a name may do observable work. A pure name may not call one.
-# Neither `Host` nor `Unit` carries anything, so both are erased: what a
-# target sees is one word going to its exit routine.
+# Nothing declares `exit!`: it is the interface to the outside, so the
+# compiler knows the name and a target answers for it.
 
-type Nat = Zero | Succ(Nat)
-type Unit = Unit
-
-platform exit! Host Nat : Unit
+type Nat Zero Succ(Nat)
 
 add(a Zero) -> a
 add(a Succ(k)) -> Succ(add(a k))

@@ -9,7 +9,7 @@
 //! deep. Anything further is refused by name rather than read wrongly.
 //!
 //! ```text
-//! type Nat = Zero | Succ(Nat)
+//! type Nat Zero Succ(Nat)
 //!
 //! add(Zero b) -> b
 //! add(Succ(a) b) -> Succ(add(a b))
@@ -29,11 +29,9 @@ enum Pattern {
     Ctor(String, Vec<String>),
 }
 
+/// A name applied to arguments, of which there may be none.
 #[derive(Clone, Debug)]
-enum Term {
-    Name(String),
-    Apply(String, Vec<Self>),
-}
+struct Term(String, Vec<Self>);
 
 #[derive(Clone, Debug)]
 struct Clause {
@@ -48,13 +46,9 @@ struct Clause {
 /// A type as written: its name, then each constructor and its field types.
 type Declared = (String, Vec<(String, Vec<String>)>);
 
-/// A platform routine as written: its name, what it takes, what it answers.
-type Stated = (String, Vec<String>, String);
-
 #[derive(Default)]
 struct Source {
     types: Vec<Declared>,
-    platforms: Vec<Stated>,
     /// The functions in the order they were first written.
     order: Vec<String>,
     clauses: HashMap<String, Vec<Clause>>,
@@ -75,13 +69,6 @@ pub fn parse(text: &str) -> Result<Program, String> {
             source.types.push(read_type(&mut words)?);
             continue;
         }
-        // Something outside answers for this one, so it states its types:
-        // there is no body to read them off.
-        if word == "platform" {
-            words.take();
-            source.platforms.push(read_platform(&mut words)?);
-            continue;
-        }
         let name = words.word()?;
         let patterns = read_patterns(&mut words)?;
         words.expect("->")?;
@@ -89,7 +76,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
         // the clause answers. A step is what is followed by an equals, which
         // is what tells a body from the clause after it.
         let mut steps = Vec::new();
-        while words.at(1).as_deref() == Some("=") {
+        while words.at(1) == Some("=") {
             let held = words.word()?;
             words.expect("=")?;
             steps.push((held, read_term(&mut words)?));
@@ -108,40 +95,29 @@ pub fn parse(text: &str) -> Result<Program, String> {
     build(&source)
 }
 
-fn read_platform(words: &mut Words) -> Result<Stated, String> {
-    let name = words.word()?;
-    let mut takes = Vec::new();
-    while words.peek().as_deref() != Some(":") {
-        takes.push(words.word()?);
-    }
-    words.expect(":")?;
-    Ok((name, takes, words.word()?))
-}
-
+/// A type and its constructors, which run until the next declaration: there
+/// is nothing between them to say where one ends, so what ends them is a
+/// `type` or a clause.
 fn read_type(words: &mut Words) -> Result<Declared, String> {
     let name = words.word()?;
-    words.expect("=")?;
     let mut ctors = Vec::new();
-    loop {
+    while words.peek().is_some_and(|word| word != "type") && !words.starts_clause() {
         let ctor = words.word()?;
-        let fields = if words.peek().as_deref() == Some("(") {
+        let fields = if words.peek() == Some("(") {
             read_names(words)?
         } else {
             Vec::new()
         };
         ctors.push((ctor, fields));
-        if words.peek().as_deref() != Some("|") {
-            return Ok((name, ctors));
-        }
-        words.take();
     }
+    Ok((name, ctors))
 }
 
 /// A parenthesised run of bare words.
 fn read_names(words: &mut Words) -> Result<Vec<String>, String> {
     words.expect("(")?;
     let mut names = Vec::new();
-    while words.peek().as_deref() != Some(")") {
+    while words.peek() != Some(")") {
         names.push(words.word()?);
     }
     words.expect(")")?;
@@ -151,9 +127,9 @@ fn read_names(words: &mut Words) -> Result<Vec<String>, String> {
 fn read_patterns(words: &mut Words) -> Result<Vec<Pattern>, String> {
     words.expect("(")?;
     let mut patterns = Vec::new();
-    while words.peek().as_deref() != Some(")") {
+    while words.peek() != Some(")") {
         let head = words.word()?;
-        patterns.push(if words.peek().as_deref() == Some("(") {
+        patterns.push(if words.peek() == Some("(") {
             Pattern::Ctor(head, read_names(words)?)
         } else {
             Pattern::Bind(head)
@@ -165,16 +141,16 @@ fn read_patterns(words: &mut Words) -> Result<Vec<Pattern>, String> {
 
 fn read_term(words: &mut Words) -> Result<Term, String> {
     let head = words.word()?;
-    if words.peek().as_deref() != Some("(") {
-        return Ok(Term::Name(head));
+    if words.peek() != Some("(") {
+        return Ok(Term(head, Vec::new()));
     }
     words.take();
     let mut args = Vec::new();
-    while words.peek().as_deref() != Some(")") {
+    while words.peek() != Some(")") {
         args.push(read_term(words)?);
     }
     words.expect(")")?;
-    Ok(Term::Apply(head, args))
+    Ok(Term(head, args))
 }
 
 const PUNCTUATION: [&str; 7] = ["(", ")", ",", "=", "|", ":", "->"];
@@ -213,13 +189,13 @@ impl Words {
         Self { words, at: 0 }
     }
 
-    fn peek(&self) -> Option<String> {
+    fn peek(&self) -> Option<&str> {
         self.at(0)
     }
 
     /// The word `ahead` past the next one.
-    fn at(&self, ahead: usize) -> Option<String> {
-        self.words.get(self.at + ahead).cloned()
+    fn at(&self, ahead: usize) -> Option<&str> {
+        self.words.get(self.at + ahead).map(String::as_str)
     }
 
     fn take(&mut self) -> Option<String> {
@@ -235,6 +211,31 @@ impl Words {
             Some(word) if !PUNCTUATION.contains(&word.as_str()) => Ok(word),
             Some(word) => Err(format!("expected a name, found `{word}`")),
             None => Err("the program ends early".to_owned()),
+        }
+    }
+
+    /// Whether what comes next is a clause rather than a constructor: a name,
+    /// a parenthesised run, and then an arrow. A constructor's own run is
+    /// followed by anything else.
+    fn starts_clause(&self) -> bool {
+        if self.at(1) != Some("(") {
+            return false;
+        }
+        let mut at = 1;
+        let mut depth = 0usize;
+        loop {
+            match self.at(at) {
+                Some("(") => depth += 1,
+                Some(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.at(at + 1) == Some("->");
+                    }
+                }
+                Some(_) => {}
+                None => return false,
+            }
+            at += 1;
         }
     }
 
@@ -255,11 +256,7 @@ fn flush(held: &mut String, words: &mut Vec<String>) {
 /// Turn what was read into a program.
 fn build(source: &Source) -> Result<Program, String> {
     let mut program = Program::default();
-    // The authority a program is given. Nothing can build one, because its
-    // constructor is not among the names a term may use, so the only way to
-    // hold one is to have been handed it.
-    let host = program.declare_type(HOST);
-    program.define_type(host, &[(HOST, &[])]);
+    declare_builtin(&mut program, source)?;
     declare_types(&mut program, source)?;
     let ctors = catalogue(&program);
     // A bare name in a pattern is a constructor if one is declared with that
@@ -277,31 +274,28 @@ fn build(source: &Source) -> Result<Program, String> {
         })
         .collect();
 
-    let mut arity: HashMap<&str, usize> = HashMap::new();
-    for name in &source.order {
-        let clauses = &clauses[name.as_str()];
-        let width = clauses[0].patterns.len();
-        if clauses.iter().any(|clause| clause.patterns.len() != width) {
-            return Err(format!("`{name}` takes a different number each clause"));
-        }
-        arity.insert(name, width);
-    }
-
-    let mut functions: HashMap<&str, FnId> = HashMap::new();
-    let stated = declare_platforms(&mut program, source, &mut functions)?;
-
+    let arity = arities(source, &clauses)?;
     colour(source)?;
-    let told = infer(source, &clauses, &program, &ctors, &arity, &stated)?;
+    let told = infer(source, &clauses, &program, &ctors, &arity)?;
+    let mut functions: HashMap<&str, FnId> = HashMap::new();
+    for (name, _) in EFFECTS {
+        if let Some((params, result)) = told.get(name) {
+            functions.insert(name, program.declare(name, params, *result));
+        }
+    }
     for name in &source.order {
         let (params, result) = &told[name];
         functions.insert(name, program.declare(name, params, *result));
     }
 
-    // Where a program starts, by name, since nothing in the text says so and
-    // the tier below needs an entry. One that does observable work says so.
-    if let Some(main) = functions.get("main!").or_else(|| functions.get("main")) {
-        program.set_entry(*main);
-    }
+    // Where a program starts, by name, since nothing in the text says so. It
+    // is effectful because a program that does nothing observable does
+    // nothing: the status it leaves with is something it says, not something
+    // that falls out of how it was called.
+    let main = functions
+        .get("main!")
+        .ok_or_else(|| "no `main!` to start at".to_owned())?;
+    program.set_entry(*main);
     define(&mut program, source, &clauses, &told, &functions)
 }
 
@@ -324,6 +318,21 @@ fn define(
         lowering.define(program, functions[name.as_str()], held, params)?;
     }
     Ok(std::mem::take(program))
+}
+
+/// The authority a program is handed, and what an effect answers when it
+/// answers nothing. Nothing can build a `Host`, because its constructor is
+/// not among the names a term may use, so the only way to hold one is to
+/// have been handed it.
+fn declare_builtin(program: &mut Program, source: &Source) -> Result<(), String> {
+    for name in BUILTIN {
+        if source.types.iter().any(|(held, _)| held == name) {
+            return Err(format!("`{name}` is the compiler's, not a program's"));
+        }
+        let id = program.declare_type(name);
+        program.define_type(id, &[(name, &[])]);
+    }
+    Ok(())
 }
 
 /// Every type the program declares, then the constructors of each, so that
@@ -353,44 +362,34 @@ fn declare_types(program: &mut Program, source: &Source) -> Result<(), String> {
     Ok(())
 }
 
-/// Every platform routine, which states its types because there is no body
-/// to read them off.
-fn declare_platforms<'a>(
-    program: &mut Program,
+/// How many arguments each name takes, which every clause of one has to
+/// agree on. An effect takes the authority and what it was blessed with.
+fn arities<'a>(
     source: &'a Source,
-    functions: &mut HashMap<&'a str, FnId>,
-) -> Result<HashMap<&'a str, Inferred>, String> {
-    let types: HashMap<String, TypeId> = (0..program.types().len())
-        .map(|at| {
-            let id = TypeId::at(at);
-            (program.name(program.type_(id).name).to_owned(), id)
-        })
-        .collect();
-    let mut stated = HashMap::new();
-    for (name, takes, answers) in &source.platforms {
-        let takes: Vec<TypeId> = takes
-            .iter()
-            .map(|held| look_owned(&types, held, "type"))
-            .collect::<Result<_, _>>()?;
-        let answers = look_owned(&types, answers, "type")?;
-        functions.insert(name, program.declare(name, &takes, answers));
-        stated.insert(name.as_str(), (takes, answers));
+    clauses: &HashMap<&str, Vec<Clause>>,
+) -> Result<HashMap<&'a str, usize>, String> {
+    let mut arity = HashMap::new();
+    for name in &source.order {
+        let held = &clauses[name.as_str()];
+        let width = held[0].patterns.len();
+        if held.iter().any(|clause| clause.patterns.len() != width) {
+            return Err(format!("`{name}` takes a different number each clause"));
+        }
+        arity.insert(name.as_str(), width);
     }
-    Ok(stated)
+    for (name, takes) in EFFECTS {
+        arity.insert(name, takes + 1);
+    }
+    Ok(arity)
 }
 
 /// A name ending in `!` may perform observable work, and a name that does
 /// not may not call one that does. One colour, stated where it is written.
 fn colour(source: &Source) -> Result<(), String> {
     fn calls(term: &Term, each: &mut impl FnMut(&str)) {
-        match term {
-            Term::Name(name) => each(name),
-            Term::Apply(name, args) => {
-                each(name);
-                for arg in args {
-                    calls(arg, each);
-                }
-            }
+        each(&term.0);
+        for arg in &term.1 {
+            calls(arg, each);
         }
     }
     for name in &source.order {
@@ -462,13 +461,22 @@ fn matched_argument(clauses: &[Clause]) -> Result<Option<usize>, String> {
     Ok(matched)
 }
 
-/// The type a program's authority has. Its constructor is left out of the
-/// names a term may use, so no program can make one for itself.
-const HOST: &str = "Host";
+/// The types the compiler declares: the authority a program is handed, and
+/// what an effect answers when it answers nothing. Neither carries anything,
+/// so both are erased, and `Host`'s constructor is left out of the names a
+/// term may use so that no program can make one for itself.
+const BUILTIN: [&str; 2] = ["Host", "Unit"];
+
+/// The effects a target answers for, and how many arguments each takes past
+/// the authority. A program declares none of these: they are the interface
+/// to the outside, so the compiler knows their names and a target provides
+/// them. What they take beyond the authority is whatever they are given.
+const EFFECTS: [(&str, usize); 1] = [("exit!", 1)];
 
 /// Every constructor a term may name.
 fn catalogue(program: &Program) -> HashMap<String, CtorId> {
     let mut ctors = HashMap::new();
+    // From past the authority, which is the one a program may not build.
     for at in 1..program.types().len() {
         let id = TypeId::at(at);
         for tag in 0..u32::try_from(program.type_(id).ctors.len()).expect("a sane count") {
@@ -477,13 +485,6 @@ fn catalogue(program: &Program) -> HashMap<String, CtorId> {
         }
     }
     ctors
-}
-
-fn look_owned<T: Copy>(table: &HashMap<String, T>, name: &str, what: &str) -> Result<T, String> {
-    table
-        .get(name)
-        .copied()
-        .ok_or_else(|| format!("no {what} named `{name}`"))
 }
 
 fn look<T: Copy>(table: &HashMap<&str, T>, name: &str, what: &str) -> Result<T, String> {
@@ -619,31 +620,21 @@ impl Lowering<'_> {
     }
 
     fn term(&self, b: &mut super::Builder, term: &Term, scope: &Scope) -> Result<Atom, String> {
-        match term {
-            Term::Name(name) => self.name(b, name, scope),
-            Term::Apply(name, args) => {
-                let args: Vec<Atom> = args
-                    .iter()
-                    .map(|arg| self.term(b, arg, scope))
-                    .collect::<Result<_, _>>()?;
-                if let Some(ctor) = self.ctors.get(name) {
-                    return Ok(b.con(*ctor, &args));
-                }
-                let id = look(self.functions, name, "function")?;
-                Ok(b.call(id, &args))
-            }
-        }
-    }
-
-    fn name(&self, b: &mut super::Builder, name: &str, scope: &Scope) -> Result<Atom, String> {
-        if let Some((_, atom)) = scope.iter().rev().find(|(held, _)| held == name) {
+        let Term(name, args) = term;
+        if args.is_empty()
+            && let Some((_, atom)) = scope.iter().rev().find(|(held, _)| held == name)
+        {
             return Ok(*atom);
         }
-        let ctor = self
-            .ctors
-            .get(name)
-            .ok_or_else(|| format!("nothing named `{name}` is in scope"))?;
-        Ok(b.con(*ctor, &[]))
+        let args: Vec<Atom> = args
+            .iter()
+            .map(|arg| self.term(b, arg, scope))
+            .collect::<Result<_, _>>()?;
+        if let Some(ctor) = self.ctors.get(name) {
+            return Ok(b.con(*ctor, &args));
+        }
+        let id = look(self.functions, name, "function")?;
+        Ok(b.call(id, &args))
     }
 }
 
@@ -725,14 +716,13 @@ fn infer(
     program: &Program,
     ctors: &HashMap<String, CtorId>,
     arity: &HashMap<&str, usize>,
-    stated: &HashMap<&str, Inferred>,
 ) -> Result<HashMap<String, Inferred>, String> {
     let mut unify = Unify {
         parent: Vec::new(),
         known: Vec::new(),
     };
     // Each function takes a run of slots: one per argument, then its result.
-    let base = slots(source, arity, stated, &mut unify)?;
+    let base = slots(source, arity, &mut unify)?;
 
     for name in &source.order {
         for clause in &clauses[name.as_str()] {
@@ -747,18 +737,18 @@ fn infer(
         }
     }
 
-    source
-        .order
-        .iter()
-        .map(|name| {
-            let at = base[name.as_str()];
-            let params = (0..arity[name.as_str()])
-                .map(|argument| tell(&mut unify, at + argument, name))
-                .collect::<Result<_, _>>()?;
-            let result = tell(&mut unify, at + arity[name.as_str()], name)?;
-            Ok((name.clone(), (params, result)))
-        })
-        .collect()
+    let mut told = HashMap::new();
+    for name in source.order.iter().map(String::as_str) {
+        told.insert(name.to_owned(), settled(&mut unify, &base, arity, name)?);
+    }
+    // An effect no program calls settles nothing, and needs to: there is
+    // nothing to declare and nothing to answer for.
+    for (name, _) in EFFECTS {
+        if let Ok(held) = settled(&mut unify, &base, arity, name) {
+            told.insert(name.to_owned(), held);
+        }
+    }
+    Ok(told)
 }
 
 /// A run of slots per function: one per argument, then its result. A
@@ -766,7 +756,6 @@ fn infer(
 fn slots<'a>(
     source: &'a Source,
     arity: &HashMap<&str, usize>,
-    stated: &HashMap<&'a str, Inferred>,
     unify: &mut Unify,
 ) -> Result<HashMap<&'a str, usize>, String> {
     let mut base = HashMap::new();
@@ -777,12 +766,18 @@ fn slots<'a>(
         }
         base.insert(name.as_str(), at);
     }
-    for (name, (takes, answers)) in stated {
+    // An effect takes the authority and answers nothing; what it takes
+    // between is whatever it is given, which is what the argument settles.
+    let (host, unit) = (TypeId::at(0), TypeId::at(1));
+    for (name, takes) in EFFECTS {
         let at = unify.parent.len();
-        for held in takes.iter().chain(std::iter::once(answers)) {
-            let slot = unify.fresh();
-            unify.pin(slot, *held)?;
+        let authority = unify.fresh();
+        unify.pin(authority, host)?;
+        for _ in 0..takes {
+            unify.fresh();
         }
+        let answer = unify.fresh();
+        unify.pin(answer, unit)?;
         base.insert(name, at);
     }
     Ok(base)
@@ -819,6 +814,21 @@ fn bound<'a>(
     Ok(scope)
 }
 
+/// What a name takes and answers, once everything it is used at agrees.
+fn settled(
+    unify: &mut Unify,
+    base: &HashMap<&str, usize>,
+    arity: &HashMap<&str, usize>,
+    name: &str,
+) -> Result<Inferred, String> {
+    let at = base[name];
+    let params = (0..arity[name])
+        .map(|argument| tell(unify, at + argument, name))
+        .collect::<Result<_, _>>()?;
+    let result = tell(unify, at + arity[name], name)?;
+    Ok((params, result))
+}
+
 fn tell(unify: &mut Unify, slot: usize, name: &str) -> Result<TypeId, String> {
     unify
         .get(slot)
@@ -834,10 +844,7 @@ fn term(
     ctors: &HashMap<String, CtorId>,
     base: &HashMap<&str, usize>,
 ) -> Result<usize, String> {
-    let (name, args) = match held {
-        Term::Name(name) => (name, [].as_slice()),
-        Term::Apply(name, args) => (name, args.as_slice()),
-    };
+    let Term(name, args) = held;
     if let Some(slot) = scope.get(name.as_str()) {
         if args.is_empty() {
             return Ok(*slot);
@@ -857,9 +864,13 @@ fn term(
         unify.pin(answer, program.ctor(*ctor).owner)?;
         return Ok(answer);
     }
-    let at = *base
-        .get(name.as_str())
-        .ok_or_else(|| format!("nothing named `{name}` is in scope"))?;
+    let at = *base.get(name.as_str()).ok_or_else(|| {
+        if name == BUILTIN[0] {
+            format!("`{name}` cannot be built; it is what `main!` is handed")
+        } else {
+            format!("nothing named `{name}` is in scope")
+        }
+    })?;
     for (argument, index) in args.iter().zip(0..) {
         let slot = term(argument, scope, unify, program, ctors, base)?;
         unify.union(slot, at + index)?;

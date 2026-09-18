@@ -6,9 +6,9 @@
 # the addition and decide the representation, so this compiles to two
 # instructions and leaves with 4.
 
-type Nat = Zero | Succ(Nat)
+type Nat Zero Succ(Nat)
 
 add(a Zero) -> a
 add(a Succ(k)) -> Succ(add(a k))
 
-main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))
+main!(h) -> exit!(h add(Succ(Succ(Zero)) Succ(Succ(Zero))))

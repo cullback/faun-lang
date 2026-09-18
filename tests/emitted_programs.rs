@@ -558,12 +558,12 @@ fn every_target_runs_two_and_two_from_barb() {
 #[test]
 fn every_target_runs_two_and_two_from_text() {
     let machine = faun::read(
-        "type Nat = Zero | Succ(Nat)
+        "type Nat Zero Succ(Nat)
 
          add(a Zero) -> a
          add(a Succ(k)) -> Succ(add(a k))
 
-         main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))",
+         main!(h) -> exit!(h add(Succ(Succ(Zero)) Succ(Succ(Zero))))",
     )
     .expect("a program");
     for target in Target::ALL {
@@ -595,10 +595,7 @@ fn every_target_runs_every_example() {
 #[test]
 fn every_target_exits_with_what_it_was_told() {
     let machine = faun::read(
-        "type Nat = Zero | Succ(Nat)
-         type Unit = Unit
-
-         platform exit! Host Nat : Unit
+        "type Nat Zero Succ(Nat)
 
          main!(h) -> exit!(h Succ(Succ(Succ(Zero))))",
     )
@@ -612,10 +609,7 @@ fn every_target_exits_with_what_it_was_told() {
 #[test]
 fn a_pure_name_cannot_call_an_effect() {
     let refused = faun::read(
-        "type Nat = Zero | Succ(Nat)
-         type Unit = Unit
-
-         platform exit! Host Nat : Unit
+        "type Nat Zero Succ(Nat)
 
          quietly(h) -> exit!(h Zero)
 
