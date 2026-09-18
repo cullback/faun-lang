@@ -32,6 +32,7 @@ mod builder;
 mod constant;
 mod facts;
 mod ir;
+mod parse;
 mod pretty;
 
 pub use builder::Builder;
@@ -41,6 +42,7 @@ pub use ir::{
     Arm, Atom, Body, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local, Program, Range,
     Symbol, Type, TypeId,
 };
+pub use parse::parse;
 
 #[cfg(test)]
 mod tests;

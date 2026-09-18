@@ -270,3 +270,56 @@ fn addition_is_recognised_and_its_near_miss_is_not() {
     });
     assert_eq!(recognise(&program).operation(wrong), None);
 }
+
+/// The surface: the same program as [`crate::two_and_two`], written out.
+#[test]
+fn a_program_reads_from_text() {
+    let program = parse(
+        "type Nat = Zero | Succ(Nat)
+
+         add(Nat, Nat) -> Nat
+         add(a, Zero) = a
+         add(a, Succ(k)) = Succ(add(a, k))
+
+         main() -> Nat
+         main() = add(2, 2)",
+    )
+    .expect("a program");
+    assert_eq!(
+        program.render(),
+        "Nat = Zero | Succ(Nat)
+
+add(v0: Nat, v1: Nat) -> Nat =
+  match v1 {
+    Zero =>
+      v0
+    Succ(v2) =>
+      v3 = add(v0, v2)
+      Succ(v3)
+  }
+
+main() -> Nat =
+  v0 = 2
+  v1 = 2
+  add(v0, v1)
+"
+    );
+}
+
+#[test]
+fn what_the_surface_will_not_read_it_names() {
+    let two = "type Nat = Zero | Succ(Nat)
+               f(Nat, Nat) -> Nat
+               f(Zero, Zero) = Zero
+               f(a, b) = a";
+    assert!(parse(two).unwrap_err().contains("one at a time"));
+
+    let missing = "type Nat = Zero | Succ(Nat)
+                   f(Nat) -> Nat
+                   f(x) = g(x)";
+    assert!(
+        parse(missing)
+            .unwrap_err()
+            .contains("no function named `g`")
+    );
+}

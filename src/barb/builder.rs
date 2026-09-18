@@ -199,6 +199,11 @@ impl Builder<'_> {
         self.emit(Expr::Call(function, args))
     }
 
+    /// Hold a number in the program's pool, for [`Self::known`].
+    pub fn number(&mut self, id: TypeId, value: u64) -> ConstId {
+        self.program.intern_number(id, value)
+    }
+
     /// A value known outright.
     pub fn known(&mut self, id: TypeId, value: ConstId) -> Atom {
         self.emit(Expr::Static(id, value))
