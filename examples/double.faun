@@ -1,0 +1,15 @@
+# Steps: a body works things out on the way, each bound where it is named.
+# The last term is what the clause answers.
+
+type Nat = Zero | Succ(Nat)
+
+add(a Zero) -> a
+add(a Succ(k)) -> Succ(add(a k))
+
+double(n) ->
+  m = add(n n)
+  m
+
+main() ->
+  two = Succ(Succ(Zero))
+  double(two)

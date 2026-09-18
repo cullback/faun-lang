@@ -323,3 +323,48 @@ fn what_the_surface_will_not_read_it_names() {
                    f(Zero) -> g(Zero)";
     assert!(parse(missing).unwrap_err().contains("nothing named `g`"));
 }
+
+/// Steps, which is what a body needs once anything answers something worth
+/// keeping: each is bound where it was named, in the order written.
+#[test]
+fn a_body_works_things_out_on_the_way() {
+    let program = parse(
+        "type Nat = Zero | Succ(Nat)
+
+         double(n) ->
+           m = add(n n)
+           m
+
+         add(a Zero) -> a
+         add(a Succ(k)) -> Succ(add(a k))
+
+         main() ->
+           two = Succ(Succ(Zero))
+           four = double(two)
+           four",
+    )
+    .expect("a program");
+    assert_eq!(
+        program.render(),
+        "Nat = Zero | Succ(Nat)
+
+double(v0: Nat) -> Nat =
+  add(v0, v0)
+
+add(v0: Nat, v1: Nat) -> Nat =
+  match v1 {
+    Zero =>
+      v0
+    Succ(v2) =>
+      v3 = add(v0, v2)
+      Succ(v3)
+  }
+
+main() -> Nat =
+  v0 = Zero
+  v1 = Succ(v0)
+  v2 = Succ(v1)
+  double(v2)
+"
+    );
+}

@@ -38,6 +38,10 @@ enum Term {
 #[derive(Clone, Debug)]
 struct Clause {
     patterns: Vec<Pattern>,
+    /// What the clause works out on the way, each bound to a name. A result
+    /// that is not wanted is bound to one that is not read.
+    steps: Vec<(String, Term)>,
+    /// What the clause answers.
     body: Term,
 }
 
@@ -70,11 +74,24 @@ pub fn parse(text: &str) -> Result<Program, String> {
         let name = words.word()?;
         let patterns = read_patterns(&mut words)?;
         words.expect("->")?;
+        // Everything up to the last term is bound to a name; the last is what
+        // the clause answers. A step is what is followed by an equals, which
+        // is what tells a body from the clause after it.
+        let mut steps = Vec::new();
+        while words.at(1).as_deref() == Some("=") {
+            let held = words.word()?;
+            words.expect("=")?;
+            steps.push((held, read_term(&mut words)?));
+        }
         let body = read_term(&mut words)?;
         if !source.clauses.contains_key(&name) {
             source.order.push(name.clone());
         }
-        let clause = Clause { patterns, body };
+        let clause = Clause {
+            patterns,
+            steps,
+            body,
+        };
         source.clauses.entry(name).or_default().push(clause);
     }
     build(&source)
@@ -176,7 +193,12 @@ impl Words {
     }
 
     fn peek(&self) -> Option<String> {
-        self.words.get(self.at).cloned()
+        self.at(0)
+    }
+
+    /// The word `ahead` past the next one.
+    fn at(&self, ahead: usize) -> Option<String> {
+        self.words.get(self.at + ahead).cloned()
     }
 
     fn take(&mut self) -> Option<String> {
@@ -317,6 +339,7 @@ fn resolve(clause: &Clause, ctors: &HashMap<String, CtorId>) -> Clause {
         .collect();
     Clause {
         patterns,
+        steps: clause.steps.clone(),
         body: clause.body.clone(),
     }
 }
@@ -410,7 +433,7 @@ impl Lowering<'_> {
         let Some(matched) = matched else {
             let clause = &clauses[0];
             let scope = bind(scope, &clause.patterns, args)?;
-            return self.term(b, &clause.body, &scope);
+            return self.body(b, clause, scope);
         };
         let scrutinee = *args
             .get(matched)
@@ -472,6 +495,19 @@ impl Lowering<'_> {
             if let Pattern::Bind(name) = pattern {
                 scope.push((name.clone(), args[at]));
             }
+        }
+        self.body(b, clause, scope)
+    }
+
+    /// A clause's steps in order, each bound where it named it, then what it
+    /// answers. Order is the order they were written: the tier below keeps a
+    /// body's bindings in the order they arrive, so an effect that must
+    /// happen first is written first.
+    fn body(&self, b: &mut super::Builder, clause: &Clause, scope: Scope) -> Result<Atom, String> {
+        let mut scope = scope;
+        for (held, step) in &clause.steps {
+            let atom = self.term(b, step, &scope)?;
+            scope.push((held.clone(), atom));
         }
         self.term(b, &clause.body, &scope)
     }
@@ -600,7 +636,11 @@ fn infer(
 
     for name in &source.order {
         for clause in &clauses[name.as_str()] {
-            let scope = bound(clause, base[name.as_str()], &mut unify, program, ctors)?;
+            let mut scope = bound(clause, base[name.as_str()], &mut unify, program, ctors)?;
+            for (held, step) in &clause.steps {
+                let slot = term(step, &scope, &mut unify, program, ctors, &base)?;
+                scope.insert(held.as_str(), slot);
+            }
             let answer = term(&clause.body, &scope, &mut unify, program, ctors, &base)?;
             let result = base[name.as_str()] + arity[name.as_str()];
             unify.union(answer, result)?;
