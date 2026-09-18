@@ -60,6 +60,18 @@ pub fn two_and_two() -> barb::Program {
     program
 }
 
+/// Read a program and lower it to the tier a target compiles: what it says,
+/// then what each definition computes, then how to compute it.
+///
+/// # Errors
+///
+/// Names what it could not read, or what it read and cannot represent.
+pub fn read(text: &str) -> Result<ir::Program, String> {
+    let program = barb::parse(text)?;
+    let facts = barb::recognise(&program);
+    ir::lower(&program, &facts)
+}
+
 #[must_use]
 pub fn compile(target: Target, program: &ir::Program) -> Vec<Artifact> {
     target.emit(program)

@@ -1,0 +1,14 @@
+# Two and two, in the whole language there is: inductive types and rewrites.
+#
+# Nothing here says a number is a machine word. `Nat` is the type its
+# declaration makes it, addition is recursion over `Succ`, and two is what
+# the program builds out of its own constructors. The tiers below recognise
+# the addition and decide the representation, so this compiles to two
+# instructions and leaves with 4.
+
+type Nat = Zero | Succ(Nat)
+
+add(a Zero) -> a
+add(a Succ(k)) -> Succ(add(a k))
+
+main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))

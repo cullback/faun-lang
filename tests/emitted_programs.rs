@@ -557,7 +557,7 @@ fn every_target_runs_two_and_two_from_barb() {
 /// The same program again, written out rather than built, and run.
 #[test]
 fn every_target_runs_two_and_two_from_text() {
-    let barb = faun::barb::parse(
+    let machine = faun::read(
         "type Nat = Zero | Succ(Nat)
 
          add(a Zero) -> a
@@ -566,9 +566,26 @@ fn every_target_runs_two_and_two_from_text() {
          main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))",
     )
     .expect("a program");
-    let facts = faun::barb::recognise(&barb);
-    let machine = faun::ir::lower(&barb, &facts).expect("a representable program");
     for target in Target::ALL {
         assert_eq!(status(target, &machine), 4, "{target}");
+    }
+}
+
+/// Every example compiles and answers what it says it does, so that one
+/// cannot rot into a program that no longer reads.
+#[test]
+fn every_target_runs_every_example() {
+    for entry in fs::read_dir("examples").expect("the examples") {
+        let path = entry.expect("an example").path();
+        let text = fs::read_to_string(&path).expect("an example to read");
+        let machine = faun::read(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for target in Target::ALL {
+            assert_eq!(
+                status(target, &machine),
+                4,
+                "{} on {target}",
+                path.display()
+            );
+        }
     }
 }

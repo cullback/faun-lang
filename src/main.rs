@@ -10,23 +10,31 @@ use bpaf::Parser;
 use bpaf::choice;
 use bpaf::construct;
 use bpaf::long;
-use bpaf::pure;
+use bpaf::positional;
 use bpaf::short;
 
 use faun::targets::Target;
 
 #[derive(Clone, Debug)]
 enum Command {
-    Build { output: PathBuf, target: Target },
-    Run,
+    Build {
+        source: PathBuf,
+        output: PathBuf,
+        target: Target,
+    },
+    Run {
+        source: PathBuf,
+    },
 }
 
 fn cli() -> OptionParser<Command> {
+    let source = || positional::<PathBuf>("PATH").help("The program to compile");
+
     let output = short('o')
         .long("output")
         .help("Where to write the result")
         .argument::<PathBuf>("PATH")
-        .fallback(PathBuf::from("hello"))
+        .fallback(PathBuf::from("a.out"))
         .debug_fallback();
 
     let target = long("target")
@@ -36,12 +44,16 @@ fn cli() -> OptionParser<Command> {
         .fallback_with(|| Target::HOST.ok_or(NO_HOST))
         .debug_fallback();
 
-    let build = construct!(Command::Build { output, target })
-        .to_options()
-        .descr("Compile the program to an executable")
-        .command("build");
+    let build = construct!(Command::Build {
+        output,
+        target,
+        source(),
+    })
+    .to_options()
+    .descr("Compile the program to an executable")
+    .command("build");
 
-    let run = pure(Command::Run)
+    let run = construct!(Command::Run { source() })
         .to_options()
         .descr("Compile the program for this machine and run it")
         .command("run");
@@ -71,18 +83,24 @@ fn main() -> ExitCode {
 
 fn dispatch(command: Command) -> Result<ExitCode, Box<dyn Error>> {
     match command {
-        Command::Build { output, target } => {
-            for path in write(target, &output)? {
+        Command::Build {
+            source,
+            output,
+            target,
+        } => {
+            let program = read(&source)?;
+            for path in write(target, &output, &program)? {
                 println!("wrote {}", path.display());
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Run => {
+        Command::Run { source } => {
+            let program = read(&source)?;
             let target = Target::HOST.ok_or(NO_HOST)?;
             let dir = std::env::temp_dir().join(format!("faun-run-{}", std::process::id()));
             fs::create_dir_all(&dir)?;
 
-            let status = write(target, &dir.join("hello"))?
+            let status = write(target, &dir.join("program"), &program)?
                 .first()
                 .map(Process::new)
                 .expect("a target emits at least one file")
@@ -95,10 +113,20 @@ fn dispatch(command: Command) -> Result<ExitCode, Box<dyn Error>> {
     }
 }
 
-fn write(target: Target, output: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// The program at `path`, read and lowered.
+fn read(path: &Path) -> Result<faun::ir::Program, Box<dyn Error>> {
+    let text = fs::read_to_string(path)?;
+    faun::read(&text).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+
+fn write(
+    target: Target,
+    output: &Path,
+    program: &faun::ir::Program,
+) -> std::io::Result<Vec<PathBuf>> {
     let mut written = Vec::new();
 
-    for artifact in faun::compile(target, &faun::hello_world()) {
+    for artifact in faun::compile(target, program) {
         let mut path = output.to_path_buf().into_os_string();
         path.push(artifact.extension);
         let path = PathBuf::from(path);

@@ -153,7 +153,12 @@ impl Words {
         let mut held = String::new();
         let mut rest = text.chars().peekable();
         while let Some(character) = rest.next() {
-            if character == '-' && rest.peek() == Some(&'>') {
+            if character == '#' {
+                flush(&mut held, &mut words);
+                while rest.peek().is_some_and(|held| *held != '\n') {
+                    rest.next();
+                }
+            } else if character == '-' && rest.peek() == Some(&'>') {
                 rest.next();
                 flush(&mut held, &mut words);
                 words.push("->".to_owned());
