@@ -560,12 +560,10 @@ fn every_target_runs_two_and_two_from_text() {
     let barb = faun::barb::parse(
         "type Nat = Zero | Succ(Nat)
 
-         add Nat Nat : Nat
          add(a Zero) -> a
          add(a Succ(k)) -> Succ(add(a k))
 
-         main : Nat
-         main() -> add(2 2)",
+         main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))",
     )
     .expect("a program");
     let facts = faun::barb::recognise(&barb);

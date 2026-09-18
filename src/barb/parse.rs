@@ -1,25 +1,24 @@
 //! A small surface for writing barb programs as text.
 //!
-//! Enough to exercise the tier, and no more. Declarations carry their types,
-//! because barb needs them and inferring them is a checker rather than a
-//! parser; a function matches on at most one argument, with patterns one
-//! constructor deep. Anything further is refused by name rather than read
-//! wrongly.
+//! Nothing is blessed: there are inductive types and there are rewrites, and
+//! a number is whatever a program builds out of its own constructors. Types
+//! are inferred, since every one of them is a name a declaration already
+//! gave, so there is nothing to infer but which.
+//!
+//! A function matches on at most one argument, with patterns one constructor
+//! deep. Anything further is refused by name rather than read wrongly.
 //!
 //! ```text
 //! type Nat = Zero | Succ(Nat)
 //!
-//! add Nat Nat : Nat
 //! add(Zero b) -> b
 //! add(Succ(a) b) -> Succ(add(a b))
 //!
-//! main : Nat
-//! main() -> add(2 2)
+//! main() -> add(Succ(Succ(Zero)) Succ(Succ(Zero)))
 //! ```
 
 use std::collections::HashMap;
 
-use super::constant::{Shape, shape};
 use super::ir::{Atom, CtorId, FnId, Program, TypeId};
 
 /// What a clause matches in one argument: a name, or a constructor and the
@@ -33,7 +32,6 @@ enum Pattern {
 #[derive(Clone, Debug)]
 enum Term {
     Name(String),
-    Number(u64),
     Apply(String, Vec<Self>),
 }
 
@@ -45,13 +43,12 @@ struct Clause {
 
 /// A type as written: its name, then each constructor and its field types.
 type Declared = (String, Vec<(String, Vec<String>)>);
-/// A signature as written: a name, its argument types, and its result type.
-type Signature = (String, Vec<String>, String);
 
 #[derive(Default)]
 struct Source {
     types: Vec<Declared>,
-    signatures: Vec<Signature>,
+    /// The functions in the order they were first written.
+    order: Vec<String>,
     clauses: HashMap<String, Vec<Clause>>,
 }
 
@@ -70,23 +67,15 @@ pub fn parse(text: &str) -> Result<Program, String> {
             source.types.push(read_type(&mut words)?);
             continue;
         }
-        // A clause takes its patterns in parentheses; a signature lists the
-        // types it takes and ends in the one it answers.
         let name = words.word()?;
-        if words.peek().as_deref() == Some("(") {
-            let patterns = read_patterns(&mut words)?;
-            words.expect("->")?;
-            let body = read_term(&mut words)?;
-            let clause = Clause { patterns, body };
-            source.clauses.entry(name).or_default().push(clause);
-        } else {
-            let mut params = Vec::new();
-            while words.peek().as_deref() != Some(":") {
-                params.push(words.word()?);
-            }
-            words.expect(":")?;
-            source.signatures.push((name, params, words.word()?));
+        let patterns = read_patterns(&mut words)?;
+        words.expect("->")?;
+        let body = read_term(&mut words)?;
+        if !source.clauses.contains_key(&name) {
+            source.order.push(name.clone());
         }
+        let clause = Clause { patterns, body };
+        source.clauses.entry(name).or_default().push(clause);
     }
     build(&source)
 }
@@ -138,9 +127,6 @@ fn read_patterns(words: &mut Words) -> Result<Vec<Pattern>, String> {
 
 fn read_term(words: &mut Words) -> Result<Term, String> {
     let head = words.word()?;
-    if let Ok(number) = head.parse::<u64>() {
-        return Ok(Term::Number(number));
-    }
     if words.peek().as_deref() != Some("(") {
         return Ok(Term::Name(head));
     }
@@ -221,58 +207,12 @@ fn flush(held: &mut String, words: &mut Vec<String>) {
 /// Turn what was read into a program.
 fn build(source: &Source) -> Result<Program, String> {
     let mut program = Program::default();
-    let mut types: HashMap<&str, TypeId> = HashMap::new();
-    for (name, _) in &source.types {
-        types.insert(name, program.declare_type(name));
-    }
-    for (name, ctors) in &source.types {
-        let ctors: Vec<(&str, Vec<TypeId>)> = ctors
-            .iter()
-            .map(|(ctor, fields)| {
-                let fields = fields
-                    .iter()
-                    .map(|field| look(&types, field, "type"))
-                    .collect::<Result<_, _>>()?;
-                Ok((ctor.as_str(), fields))
-            })
-            .collect::<Result<_, String>>()?;
-        let ctors: Vec<(&str, &[TypeId])> = ctors
-            .iter()
-            .map(|(ctor, fields)| (*ctor, fields.as_slice()))
-            .collect();
-        program.define_type(types[name.as_str()], &ctors);
-    }
-
-    let mut functions: HashMap<&str, FnId> = HashMap::new();
-    for (name, params, result) in &source.signatures {
-        let params: Vec<TypeId> = params
-            .iter()
-            .map(|param| look(&types, param, "type"))
-            .collect::<Result<_, _>>()?;
-        let result = look(&types, result, "type")?;
-        functions.insert(name, program.declare(name, &params, result));
-    }
-
-    // `main` is where a program starts, by name, since nothing in the text
-    // says so and the tier below needs an entry.
-    if let Some(main) = functions.get("main") {
-        program.set_entry(*main);
-    }
-    define(&mut program, source, &types, &functions)
-}
-
-/// Compile every function's clauses into its body.
-fn define(
-    program: &mut Program,
-    source: &Source,
-    types: &HashMap<&str, TypeId>,
-    functions: &HashMap<&str, FnId>,
-) -> Result<Program, String> {
-    let ctors = catalogue(program);
-    let number = only_number(program);
+    declare_types(&mut program, source)?;
+    let ctors = catalogue(&program);
     // A bare name in a pattern is a constructor if one is declared with that
     // name, and a binder otherwise. Nothing in the text says which, so this
-    // is the first point that can tell.
+    // is the first point that can tell -- and everything after reads the
+    // resolved clauses, inference included.
     let clauses: HashMap<&str, Vec<Clause>> = source
         .clauses
         .iter()
@@ -283,22 +223,78 @@ fn define(
             )
         })
         .collect();
+
+    let mut arity: HashMap<&str, usize> = HashMap::new();
+    for name in &source.order {
+        let clauses = &clauses[name.as_str()];
+        let width = clauses[0].patterns.len();
+        if clauses.iter().any(|clause| clause.patterns.len() != width) {
+            return Err(format!("`{name}` takes a different number each clause"));
+        }
+        arity.insert(name, width);
+    }
+
+    let told = infer(source, &clauses, &program, &ctors, &arity)?;
+    let mut functions: HashMap<&str, FnId> = HashMap::new();
+    for name in &source.order {
+        let (params, result) = &told[name];
+        functions.insert(name, program.declare(name, params, *result));
+    }
+
+    // `main` is where a program starts, by name, since nothing in the text
+    // says so and the tier below needs an entry.
+    if let Some(main) = functions.get("main") {
+        program.set_entry(*main);
+    }
+    define(&mut program, source, &clauses, &told, &functions)
+}
+
+/// Compile every function's clauses into its body.
+fn define(
+    program: &mut Program,
+    source: &Source,
+    clauses: &HashMap<&str, Vec<Clause>>,
+    told: &HashMap<String, Inferred>,
+    functions: &HashMap<&str, FnId>,
+) -> Result<Program, String> {
+    let ctors = catalogue(program);
     let lowering = Lowering {
         ctors: &ctors,
         functions,
-        number,
     };
-    for (name, params, _) in &source.signatures {
-        let held = clauses
-            .get(name.as_str())
-            .ok_or_else(|| format!("`{name}` is declared and never defined"))?;
-        let types: Vec<TypeId> = params
-            .iter()
-            .map(|param| look(types, param, "type"))
-            .collect::<Result<_, _>>()?;
-        lowering.define(program, functions[name.as_str()], held, &types)?;
+    for name in &source.order {
+        let held = &clauses[name.as_str()];
+        let (params, _) = &told[name];
+        lowering.define(program, functions[name.as_str()], held, params)?;
     }
     Ok(std::mem::take(program))
+}
+
+/// Every type the program declares, then the constructors of each, so that
+/// a field may name a type declared later.
+fn declare_types(program: &mut Program, source: &Source) -> Result<(), String> {
+    let mut types: HashMap<&str, TypeId> = HashMap::new();
+    for (name, _) in &source.types {
+        types.insert(name, program.declare_type(name));
+    }
+    for (name, ctors) in &source.types {
+        let held: Vec<(&str, Vec<TypeId>)> = ctors
+            .iter()
+            .map(|(ctor, fields)| {
+                let fields = fields
+                    .iter()
+                    .map(|field| look(&types, field, "type"))
+                    .collect::<Result<_, _>>()?;
+                Ok((ctor.as_str(), fields))
+            })
+            .collect::<Result<_, String>>()?;
+        let held: Vec<(&str, &[TypeId])> = held
+            .iter()
+            .map(|(ctor, fields)| (*ctor, fields.as_slice()))
+            .collect();
+        program.define_type(types[name.as_str()], &held);
+    }
+    Ok(())
 }
 
 /// A pattern naming a declared constructor is that constructor, not a name
@@ -366,30 +362,9 @@ fn look<T: Copy>(table: &HashMap<&str, T>, name: &str, what: &str) -> Result<T, 
 struct Lowering<'a> {
     ctors: &'a HashMap<String, CtorId>,
     functions: &'a HashMap<&'a str, FnId>,
-    /// The type a bare numeral takes, when exactly one type holds numbers.
-    number: Option<TypeId>,
 }
 
-/// The one type whose values are numbers, when the program declares one. A
-/// numeral means nothing without it, and means two things with two.
-fn only_number(program: &Program) -> Option<TypeId> {
-    let mut found = None;
-    for at in 0..program.types().len() {
-        let id = TypeId::at(at);
-        let Shape::Spine { cons, .. } = shape(program, id) else {
-            continue;
-        };
-        if program.fields(cons).len() != 1 {
-            continue;
-        }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(id);
-    }
-    found
-}
-
+/// The names a clause has bound, and what each stands for.
 type Scope = Vec<(String, Atom)>;
 
 impl Lowering<'_> {
@@ -499,13 +474,6 @@ impl Lowering<'_> {
     fn term(&self, b: &mut super::Builder, term: &Term, scope: &Scope) -> Result<Atom, String> {
         match term {
             Term::Name(name) => self.name(b, name, scope),
-            Term::Number(value) => {
-                let id = self.number.ok_or_else(|| {
-                    format!("`{value}` needs exactly one number type in the program")
-                })?;
-                let held = b.number(id, *value);
-                Ok(b.known(id, held))
-            }
             Term::Apply(name, args) => {
                 let args: Vec<Atom> = args
                     .iter()
@@ -541,4 +509,188 @@ fn bind(mut scope: Scope, patterns: &[Pattern], args: &[Atom]) -> Result<Scope, 
         }
     }
     Ok(scope)
+}
+
+/// What a function takes and answers, worked out rather than declared.
+type Inferred = (Vec<TypeId>, TypeId);
+
+/// Slots that must hold the same type, and the type they hold once anything
+/// pins it. Every type here is a name some declaration already gave, so
+/// there is nothing to infer but which one.
+struct Unify {
+    parent: Vec<usize>,
+    known: Vec<Option<TypeId>>,
+}
+
+impl Unify {
+    fn fresh(&mut self) -> usize {
+        self.parent.push(self.parent.len());
+        self.known.push(None);
+        self.parent.len() - 1
+    }
+
+    fn find(&mut self, slot: usize) -> usize {
+        let mut at = slot;
+        while self.parent[at] != at {
+            self.parent[at] = self.parent[self.parent[at]];
+            at = self.parent[at];
+        }
+        at
+    }
+
+    fn union(&mut self, left: usize, right: usize) -> Result<(), String> {
+        let (left, right) = (self.find(left), self.find(right));
+        if left == right {
+            return Ok(());
+        }
+        let held = match (self.known[left], self.known[right]) {
+            (Some(one), Some(other)) if one != other => {
+                return Err("a value is used at two types".to_owned());
+            }
+            (held, other) => held.or(other),
+        };
+        self.parent[right] = left;
+        self.known[left] = held;
+        Ok(())
+    }
+
+    fn pin(&mut self, slot: usize, id: TypeId) -> Result<(), String> {
+        let slot = self.find(slot);
+        match self.known[slot] {
+            Some(held) if held != id => Err("a value is used at two types".to_owned()),
+            _ => {
+                self.known[slot] = Some(id);
+                Ok(())
+            }
+        }
+    }
+
+    fn get(&mut self, slot: usize) -> Option<TypeId> {
+        let slot = self.find(slot);
+        self.known[slot]
+    }
+}
+
+/// Work out what every function takes and answers.
+fn infer(
+    source: &Source,
+    clauses: &HashMap<&str, Vec<Clause>>,
+    program: &Program,
+    ctors: &HashMap<String, CtorId>,
+    arity: &HashMap<&str, usize>,
+) -> Result<HashMap<String, Inferred>, String> {
+    let mut unify = Unify {
+        parent: Vec::new(),
+        known: Vec::new(),
+    };
+    // Each function takes a run of slots: one per argument, then its result.
+    let mut base: HashMap<&str, usize> = HashMap::new();
+    for name in &source.order {
+        let at = unify.parent.len();
+        for _ in 0..=arity[name.as_str()] {
+            unify.fresh();
+        }
+        base.insert(name, at);
+    }
+
+    for name in &source.order {
+        for clause in &clauses[name.as_str()] {
+            let scope = bound(clause, base[name.as_str()], &mut unify, program, ctors)?;
+            let answer = term(&clause.body, &scope, &mut unify, program, ctors, &base)?;
+            let result = base[name.as_str()] + arity[name.as_str()];
+            unify.union(answer, result)?;
+        }
+    }
+
+    source
+        .order
+        .iter()
+        .map(|name| {
+            let at = base[name.as_str()];
+            let params = (0..arity[name.as_str()])
+                .map(|argument| tell(&mut unify, at + argument, name))
+                .collect::<Result<_, _>>()?;
+            let result = tell(&mut unify, at + arity[name.as_str()], name)?;
+            Ok((name.clone(), (params, result)))
+        })
+        .collect()
+}
+
+/// What a clause's patterns bind: an argument's own slot where the pattern
+/// names it, and a fresh slot per field where it takes one apart.
+fn bound<'a>(
+    clause: &'a Clause,
+    base: usize,
+    unify: &mut Unify,
+    program: &Program,
+    ctors: &HashMap<String, CtorId>,
+) -> Result<HashMap<&'a str, usize>, String> {
+    let mut scope = HashMap::new();
+    for (at, pattern) in clause.patterns.iter().enumerate() {
+        match pattern {
+            Pattern::Bind(held) => {
+                scope.insert(held.as_str(), base + at);
+            }
+            Pattern::Ctor(ctor, fields) => {
+                let id = *ctors
+                    .get(ctor)
+                    .ok_or_else(|| format!("no constructor named `{ctor}`"))?;
+                unify.pin(base + at, program.ctor(id).owner)?;
+                for (field, held) in program.fields(id).to_vec().iter().zip(fields) {
+                    let slot = unify.fresh();
+                    unify.pin(slot, *field)?;
+                    scope.insert(held.as_str(), slot);
+                }
+            }
+        }
+    }
+    Ok(scope)
+}
+
+fn tell(unify: &mut Unify, slot: usize, name: &str) -> Result<TypeId, String> {
+    unify
+        .get(slot)
+        .ok_or_else(|| format!("nothing says what type `{name}` works over"))
+}
+
+/// The slot a term's type lives in, constraining what it is built from.
+fn term(
+    held: &Term,
+    scope: &HashMap<&str, usize>,
+    unify: &mut Unify,
+    program: &Program,
+    ctors: &HashMap<String, CtorId>,
+    base: &HashMap<&str, usize>,
+) -> Result<usize, String> {
+    let (name, args) = match held {
+        Term::Name(name) => (name, [].as_slice()),
+        Term::Apply(name, args) => (name, args.as_slice()),
+    };
+    if let Some(slot) = scope.get(name.as_str()) {
+        if args.is_empty() {
+            return Ok(*slot);
+        }
+        return Err(format!("`{name}` is a value, not something to apply"));
+    }
+    if let Some(ctor) = ctors.get(name) {
+        let fields = program.fields(*ctor).to_vec();
+        if fields.len() != args.len() {
+            return Err(format!("`{name}` takes {} fields", fields.len()));
+        }
+        for (argument, field) in args.iter().zip(fields) {
+            let slot = term(argument, scope, unify, program, ctors, base)?;
+            unify.pin(slot, field)?;
+        }
+        let answer = unify.fresh();
+        unify.pin(answer, program.ctor(*ctor).owner)?;
+        return Ok(answer);
+    }
+    let at = *base
+        .get(name.as_str())
+        .ok_or_else(|| format!("nothing named `{name}` is in scope"))?;
+    for (argument, index) in args.iter().zip(0..) {
+        let slot = term(argument, scope, unify, program, ctors, base)?;
+        unify.union(slot, at + index)?;
+    }
+    Ok(at + args.len())
 }
