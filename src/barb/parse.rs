@@ -9,12 +9,12 @@
 //! ```text
 //! type Nat = Zero | Succ(Nat)
 //!
-//! add(Nat, Nat) -> Nat
-//! add(Zero, b) = b
-//! add(Succ(a), b) = Succ(add(a, b))
+//! add Nat Nat : Nat
+//! add(Zero b) -> b
+//! add(Succ(a) b) -> Succ(add(a b))
 //!
-//! main() -> Nat
-//! main() = add(2, 2)
+//! main : Nat
+//! main() -> add(2 2)
 //! ```
 
 use std::collections::HashMap;
@@ -70,34 +70,25 @@ pub fn parse(text: &str) -> Result<Program, String> {
             source.types.push(read_type(&mut words)?);
             continue;
         }
+        // A clause takes its patterns in parentheses; a signature lists the
+        // types it takes and ends in the one it answers.
         let name = words.word()?;
-        let heads = read_patterns(&mut words)?;
-        match words.take().as_deref() {
-            Some("->") => {
-                let result = words.word()?;
-                let params = heads.into_iter().map(named).collect::<Result<_, _>>()?;
-                source.signatures.push((name, params, result));
+        if words.peek().as_deref() == Some("(") {
+            let patterns = read_patterns(&mut words)?;
+            words.expect("->")?;
+            let body = read_term(&mut words)?;
+            let clause = Clause { patterns, body };
+            source.clauses.entry(name).or_default().push(clause);
+        } else {
+            let mut params = Vec::new();
+            while words.peek().as_deref() != Some(":") {
+                params.push(words.word()?);
             }
-            Some("=") => {
-                let body = read_term(&mut words)?;
-                let clause = Clause {
-                    patterns: heads,
-                    body,
-                };
-                source.clauses.entry(name).or_default().push(clause);
-            }
-            other => return Err(format!("expected `->` or `=`, found {other:?}")),
+            words.expect(":")?;
+            source.signatures.push((name, params, words.word()?));
         }
     }
     build(&source)
-}
-
-/// A signature's arguments are type names, which parse as bare patterns.
-fn named(pattern: Pattern) -> Result<String, String> {
-    match pattern {
-        Pattern::Bind(name) => Ok(name),
-        Pattern::Ctor(name, _) => Err(format!("`{name}` is a pattern where a type was expected")),
-    }
 }
 
 fn read_type(words: &mut Words) -> Result<Declared, String> {
@@ -119,15 +110,12 @@ fn read_type(words: &mut Words) -> Result<Declared, String> {
     }
 }
 
-/// A parenthesised, comma-separated run of bare words.
+/// A parenthesised run of bare words.
 fn read_names(words: &mut Words) -> Result<Vec<String>, String> {
     words.expect("(")?;
     let mut names = Vec::new();
     while words.peek().as_deref() != Some(")") {
         names.push(words.word()?);
-        if words.peek().as_deref() == Some(",") {
-            words.take();
-        }
     }
     words.expect(")")?;
     Ok(names)
@@ -143,9 +131,6 @@ fn read_patterns(words: &mut Words) -> Result<Vec<Pattern>, String> {
         } else {
             Pattern::Bind(head)
         });
-        if words.peek().as_deref() == Some(",") {
-            words.take();
-        }
     }
     words.expect(")")?;
     Ok(patterns)
@@ -163,13 +148,12 @@ fn read_term(words: &mut Words) -> Result<Term, String> {
     let mut args = Vec::new();
     while words.peek().as_deref() != Some(")") {
         args.push(read_term(words)?);
-        if words.peek().as_deref() == Some(",") {
-            words.take();
-        }
     }
     words.expect(")")?;
     Ok(Term::Apply(head, args))
 }
+
+const PUNCTUATION: [&str; 7] = ["(", ")", ",", "=", "|", ":", "->"];
 
 /// Words and punctuation, in order.
 struct Words {
@@ -187,7 +171,7 @@ impl Words {
                 rest.next();
                 flush(&mut held, &mut words);
                 words.push("->".to_owned());
-            } else if "(),=|".contains(character) {
+            } else if "(),=|:".contains(character) {
                 flush(&mut held, &mut words);
                 words.push(character.to_string());
             } else if character.is_whitespace() {
@@ -210,9 +194,14 @@ impl Words {
         word
     }
 
+    /// A name. Punctuation is never one, so a stray comma is refused rather
+    /// than bound as though it were a variable.
     fn word(&mut self) -> Result<String, String> {
-        self.take()
-            .ok_or_else(|| "the program ends early".to_owned())
+        match self.take() {
+            Some(word) if !PUNCTUATION.contains(&word.as_str()) => Ok(word),
+            Some(word) => Err(format!("expected a name, found `{word}`")),
+            None => Err("the program ends early".to_owned()),
+        }
     }
 
     fn expect(&mut self, want: &str) -> Result<(), String> {

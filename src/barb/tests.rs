@@ -277,12 +277,12 @@ fn a_program_reads_from_text() {
     let program = parse(
         "type Nat = Zero | Succ(Nat)
 
-         add(Nat, Nat) -> Nat
-         add(a, Zero) = a
-         add(a, Succ(k)) = Succ(add(a, k))
+         add Nat Nat : Nat
+         add(a Zero) -> a
+         add(a Succ(k)) -> Succ(add(a k))
 
-         main() -> Nat
-         main() = add(2, 2)",
+         main : Nat
+         main() -> add(2 2)",
     )
     .expect("a program");
     assert_eq!(
@@ -309,14 +309,19 @@ main() -> Nat =
 #[test]
 fn what_the_surface_will_not_read_it_names() {
     let two = "type Nat = Zero | Succ(Nat)
-               f(Nat, Nat) -> Nat
-               f(Zero, Zero) = Zero
-               f(a, b) = a";
+               f Nat Nat : Nat
+               f(Zero Zero) -> Zero
+               f(a b) -> a";
     assert!(parse(two).unwrap_err().contains("one at a time"));
 
+    let comma = "type Nat = Zero | Succ(Nat)
+                 f Nat Nat : Nat
+                 f(a, b) -> a";
+    assert!(parse(comma).unwrap_err().contains("found `,`"));
+
     let missing = "type Nat = Zero | Succ(Nat)
-                   f(Nat) -> Nat
-                   f(x) = g(x)";
+                   f Nat : Nat
+                   f(x) -> g(x)";
     assert!(
         parse(missing)
             .unwrap_err()
