@@ -237,3 +237,36 @@ main() -> Nat =
 "
     );
 }
+
+#[test]
+fn addition_is_recognised_and_its_near_miss_is_not() {
+    let program = crate::two_and_two();
+    let facts = recognise(&program);
+    let add = FnId::at(0);
+    assert_eq!(program.name(program.function(add).name), "add");
+    assert_eq!(facts.operation(add), Some(Operation::Add));
+    assert_eq!(
+        facts.operation(FnId::at(1)),
+        None,
+        "main takes no arguments"
+    );
+
+    // The same shape, answering the argument it counted down rather than the
+    // one it kept. That is the identity on its second argument, not addition.
+    let mut program = Program::default();
+    let nat = program.declare_type("Nat");
+    program.define_type(nat, &[("Zero", &[]), ("Succ", &[nat])]);
+    let wrong = program.declare("wrong", &[nat, nat], nat);
+    program.define(wrong, |b, args| {
+        let right = args[1];
+        b.match_(right, nat, |b, ctor, fields| match fields {
+            [] => right,
+            [k] => {
+                let rest = b.call(wrong, &[args[0], *k]);
+                b.con(ctor, &[rest])
+            }
+            _ => unreachable!("Nat takes at most one field"),
+        })
+    });
+    assert_eq!(recognise(&program).operation(wrong), None);
+}

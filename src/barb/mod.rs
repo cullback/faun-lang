@@ -30,11 +30,13 @@
 
 mod builder;
 mod constant;
+mod facts;
 mod ir;
 mod pretty;
 
 pub use builder::Builder;
 pub use constant::{Shape, Value, as_bytes, as_number, decode, shape};
+pub use facts::{Facts, Operation, recognise};
 pub use ir::{
     Arm, Atom, Body, ConstId, Ctor, CtorId, Expr, ExprId, FnId, Function, Local, Program, Range,
     Symbol, Type, TypeId,

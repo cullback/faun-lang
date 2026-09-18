@@ -26,18 +26,25 @@ use super::validate::validate;
 /// # Panics
 ///
 /// If `program` has no entry.
-pub fn lower(program: &barb::Program) -> Result<Program, String> {
+pub fn lower(program: &barb::Program, facts: &barb::Facts) -> Result<Program, String> {
     let entry = program.entry().expect("a program to lower has an entry");
     let classes: Vec<Class> = (0..program.types().len())
         .map(|at| represent(program, barb::TypeId::at(at)))
         .collect::<Result<_, _>>()?;
 
     let (mut machine, main) = Program::new(program.name(program.function(entry).name));
-    let mut functions: Vec<FunctionId> = Vec::with_capacity(program.functions().len());
+    // `None` where a definition became an instruction and has no function.
+    let mut functions: Vec<Option<FunctionId>> = Vec::with_capacity(program.functions().len());
     for at in 0..program.functions().len() {
         let id = barb::FnId::at(at);
         if id == entry {
-            functions.push(main);
+            functions.push(Some(main));
+            continue;
+        }
+        // A definition the tier below has an instruction for is never
+        // emitted: its callers write the instruction instead.
+        if facts.operation(id).is_some() {
+            functions.push(None);
             continue;
         }
         let function = program.function(id);
@@ -48,16 +55,20 @@ pub fn lower(program: &barb::Program) -> Result<Program, String> {
             .collect();
         let name = program.name(function.name);
         let returns = [classes[function.result.index()]];
-        functions.push(machine.declare(name, &params, &returns));
+        functions.push(Some(machine.declare(name, &params, &returns)));
     }
 
     let lowering = Lowering {
         barb: program,
+        facts,
         classes,
         functions,
     };
     for at in 0..program.functions().len() {
-        lowering.function(&mut machine, barb::FnId::at(at));
+        let id = barb::FnId::at(at);
+        if facts.operation(id).is_none() {
+            lowering.function(&mut machine, id);
+        }
     }
     validate(&machine)?;
     Ok(machine)
@@ -79,16 +90,19 @@ fn represent(program: &barb::Program, id: barb::TypeId) -> Result<Class, String>
 
 struct Lowering<'a> {
     barb: &'a barb::Program,
+    facts: &'a barb::Facts,
     /// The class each barb type takes, by type.
     classes: Vec<Class>,
-    /// The machine function each barb function became, by function.
-    functions: Vec<FunctionId>,
+    /// The machine function each barb function became, by function, and
+    /// `None` for one that became an instruction.
+    functions: Vec<Option<FunctionId>>,
 }
 
 impl Lowering<'_> {
     fn function(&self, machine: &mut Program, id: barb::FnId) {
         let body = self.barb.function(id).body;
-        machine.define(self.functions[id.index()], |b, params| {
+        let into = self.functions[id.index()].expect("a function that is not an instruction");
+        machine.define(into, |b, params| {
             let mut locals = params.to_vec();
             let answer = self.body(b, body, &mut locals);
             b.ret(&[answer])
@@ -120,7 +134,14 @@ impl Lowering<'_> {
                     .iter()
                     .map(|atom| locals[atom.0.index()])
                     .collect();
-                b.call(self.functions[function.index()], &args)[0]
+                match self.facts.operation(function) {
+                    Some(barb::Operation::Add) => b.binary(Binary::Add, args[0], args[1]),
+                    None => {
+                        let callee = self.functions[function.index()]
+                            .expect("a call to something that stayed a function");
+                        b.call(callee, &args)[0]
+                    }
+                }
             }
             barb::Expr::Match(scrutinee, arms) => {
                 let scrutinee = locals[scrutinee.0.index()];

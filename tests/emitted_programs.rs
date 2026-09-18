@@ -542,7 +542,13 @@ fn write(target: Target, output: &Path, program: &Program) -> PathBuf {
 /// which is where it becomes a word.
 #[test]
 fn every_target_runs_two_and_two_from_barb() {
-    let machine = faun::ir::lower(&faun::two_and_two()).expect("a representable program");
+    let barb = faun::two_and_two();
+    let facts = faun::barb::recognise(&barb);
+    let machine = faun::ir::lower(&barb, &facts).expect("a representable program");
+
+    // `add` was recognised, so it is an instruction rather than a function:
+    // what is left is the entry alone.
+    assert_eq!(machine.functions().len(), 1, "only the entry survives");
     for target in Target::ALL {
         assert_eq!(status(target, &machine), 4, "{target}");
     }
