@@ -61,7 +61,10 @@ impl Program {
             self.name(self.type_(function.result).name)
         );
         let level = u32::try_from(self.params(id).len()).expect("a sane arity");
-        self.render_body(function.body, level, 1, out);
+        match function.body {
+            Some(body) => self.render_body(body, level, 1, out),
+            None => out.push_str("  <elsewhere>\n"),
+        }
     }
 
     /// Each binding on its own line, then what the body answers.

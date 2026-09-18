@@ -1,0 +1,22 @@
+# The authority a program is handed, and the one effect there is so far.
+#
+# `Host` is a type nothing can build: its constructor is not among the names
+# a term may use, so the only way to hold one is to have been handed it by
+# `main!`. An effect takes it, which is what makes the authority show up in
+# every signature that passes it along.
+#
+# The `!` says a name may do observable work. A pure name may not call one.
+# Neither `Host` nor `Unit` carries anything, so both are erased: what a
+# target sees is one word going to its exit routine.
+
+type Nat = Zero | Succ(Nat)
+type Unit = Unit
+
+platform exit! Host Nat : Unit
+
+add(a Zero) -> a
+add(a Succ(k)) -> Succ(add(a k))
+
+main!(h) ->
+  two = Succ(Succ(Zero))
+  exit!(h add(two two))

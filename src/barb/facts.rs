@@ -68,7 +68,7 @@ fn operation(program: &Program, id: FnId) -> Option<Operation> {
     }
 
     // The body is the match itself, over one of the two parameters.
-    let body = function.body;
+    let body = function.body?;
     if !program.bindings(body.bindings).is_empty() {
         return None;
     }

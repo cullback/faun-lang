@@ -106,7 +106,9 @@ pub struct Function {
     /// The types of its parameters, which are the first locals.
     pub params: Range,
     pub result: TypeId,
-    pub body: Body,
+    /// What it rewrites to, or nothing when the program only declares it and
+    /// something outside answers for it.
+    pub body: Option<Body>,
 }
 
 /// A program, and the pools every part of it lives in.
@@ -192,7 +194,9 @@ impl Program {
                 .unwrap_or(at)
         }
         let params = u32::try_from(self.params(id).len()).expect("a sane arity");
-        in_body(self, self.function(id).body, params)
+        self.function(id)
+            .body
+            .map_or(params, |body| in_body(self, body, params))
     }
 
     #[must_use]

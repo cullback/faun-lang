@@ -75,11 +75,7 @@ impl Program {
             name,
             params: Range::of(at, params.len()),
             result,
-            // Replaced by `define`; a declared function has no body yet.
-            body: Body {
-                bindings: Range::default(),
-                tail: ExprId(0),
-            },
+            body: None,
         });
         FnId::at(self.functions.len() - 1)
     }
@@ -169,7 +165,7 @@ impl Program {
             level: 0,
         };
         let body = builder.scope(arity, build);
-        self.functions[id.index()].body = body;
+        self.functions[id.index()].body = Some(body);
     }
 }
 

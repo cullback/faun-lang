@@ -205,7 +205,14 @@ struct Lowering<'a> {
 impl Lowering<'_> {
     /// Falling off the end of `_start` already means success, so an entry
     /// returning a constant zero costs nothing and needs no import.
+    ///
+    /// A program that leaves through the routine itself still needs it,
+    /// whatever its entry says it returns: what follows such a call never
+    /// runs, so the return there says nothing about how the program ends.
     fn needs_proc_exit(&self) -> bool {
+        if self.calls_exit() {
+            return true;
+        }
         let entry = &self.program.functions()[self.entry.index()];
         let terminator = self.program.region(entry.body).terminator;
         if terminator.exit != Exit::Return {
@@ -215,6 +222,28 @@ impl Lowering<'_> {
             .values(terminator.values)
             .first()
             .is_some_and(|&value| self.constant(value) != Some(0))
+    }
+
+    fn calls_exit(&self) -> bool {
+        fn within(program: &Program, region: RegionId) -> bool {
+            program.ops(region).iter().any(|op| match *op {
+                Op::PlatformCall { platform, .. } => {
+                    let name = program.platforms()[platform.index()].name;
+                    program.name(name) == "exit"
+                }
+                Op::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => within(program, then_region) || within(program, else_region),
+                Op::Loop { body, .. } => within(program, body),
+                _ => false,
+            })
+        }
+        self.program
+            .functions()
+            .iter()
+            .any(|function| within(self.program, function.body))
     }
 
     /// `_start` returns nothing of its own, whatever the entry's signature

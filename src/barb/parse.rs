@@ -48,9 +48,13 @@ struct Clause {
 /// A type as written: its name, then each constructor and its field types.
 type Declared = (String, Vec<(String, Vec<String>)>);
 
+/// A platform routine as written: its name, what it takes, what it answers.
+type Stated = (String, Vec<String>, String);
+
 #[derive(Default)]
 struct Source {
     types: Vec<Declared>,
+    platforms: Vec<Stated>,
     /// The functions in the order they were first written.
     order: Vec<String>,
     clauses: HashMap<String, Vec<Clause>>,
@@ -69,6 +73,13 @@ pub fn parse(text: &str) -> Result<Program, String> {
         if word == "type" {
             words.take();
             source.types.push(read_type(&mut words)?);
+            continue;
+        }
+        // Something outside answers for this one, so it states its types:
+        // there is no body to read them off.
+        if word == "platform" {
+            words.take();
+            source.platforms.push(read_platform(&mut words)?);
             continue;
         }
         let name = words.word()?;
@@ -95,6 +106,16 @@ pub fn parse(text: &str) -> Result<Program, String> {
         source.clauses.entry(name).or_default().push(clause);
     }
     build(&source)
+}
+
+fn read_platform(words: &mut Words) -> Result<Stated, String> {
+    let name = words.word()?;
+    let mut takes = Vec::new();
+    while words.peek().as_deref() != Some(":") {
+        takes.push(words.word()?);
+    }
+    words.expect(":")?;
+    Ok((name, takes, words.word()?))
 }
 
 fn read_type(words: &mut Words) -> Result<Declared, String> {
@@ -234,6 +255,11 @@ fn flush(held: &mut String, words: &mut Vec<String>) {
 /// Turn what was read into a program.
 fn build(source: &Source) -> Result<Program, String> {
     let mut program = Program::default();
+    // The authority a program is given. Nothing can build one, because its
+    // constructor is not among the names a term may use, so the only way to
+    // hold one is to have been handed it.
+    let host = program.declare_type(HOST);
+    program.define_type(host, &[(HOST, &[])]);
     declare_types(&mut program, source)?;
     let ctors = catalogue(&program);
     // A bare name in a pattern is a constructor if one is declared with that
@@ -261,16 +287,19 @@ fn build(source: &Source) -> Result<Program, String> {
         arity.insert(name, width);
     }
 
-    let told = infer(source, &clauses, &program, &ctors, &arity)?;
     let mut functions: HashMap<&str, FnId> = HashMap::new();
+    let stated = declare_platforms(&mut program, source, &mut functions)?;
+
+    colour(source)?;
+    let told = infer(source, &clauses, &program, &ctors, &arity, &stated)?;
     for name in &source.order {
         let (params, result) = &told[name];
         functions.insert(name, program.declare(name, params, *result));
     }
 
-    // `main` is where a program starts, by name, since nothing in the text
-    // says so and the tier below needs an entry.
-    if let Some(main) = functions.get("main") {
+    // Where a program starts, by name, since nothing in the text says so and
+    // the tier below needs an entry. One that does observable work says so.
+    if let Some(main) = functions.get("main!").or_else(|| functions.get("main")) {
         program.set_entry(*main);
     }
     define(&mut program, source, &clauses, &told, &functions)
@@ -324,6 +353,72 @@ fn declare_types(program: &mut Program, source: &Source) -> Result<(), String> {
     Ok(())
 }
 
+/// Every platform routine, which states its types because there is no body
+/// to read them off.
+fn declare_platforms<'a>(
+    program: &mut Program,
+    source: &'a Source,
+    functions: &mut HashMap<&'a str, FnId>,
+) -> Result<HashMap<&'a str, Inferred>, String> {
+    let types: HashMap<String, TypeId> = (0..program.types().len())
+        .map(|at| {
+            let id = TypeId::at(at);
+            (program.name(program.type_(id).name).to_owned(), id)
+        })
+        .collect();
+    let mut stated = HashMap::new();
+    for (name, takes, answers) in &source.platforms {
+        let takes: Vec<TypeId> = takes
+            .iter()
+            .map(|held| look_owned(&types, held, "type"))
+            .collect::<Result<_, _>>()?;
+        let answers = look_owned(&types, answers, "type")?;
+        functions.insert(name, program.declare(name, &takes, answers));
+        stated.insert(name.as_str(), (takes, answers));
+    }
+    Ok(stated)
+}
+
+/// A name ending in `!` may perform observable work, and a name that does
+/// not may not call one that does. One colour, stated where it is written.
+fn colour(source: &Source) -> Result<(), String> {
+    fn calls(term: &Term, each: &mut impl FnMut(&str)) {
+        match term {
+            Term::Name(name) => each(name),
+            Term::Apply(name, args) => {
+                each(name);
+                for arg in args {
+                    calls(arg, each);
+                }
+            }
+        }
+    }
+    for name in &source.order {
+        if name.ends_with('!') {
+            continue;
+        }
+        for clause in &source.clauses[name] {
+            let mut found = None;
+            for term in clause
+                .steps
+                .iter()
+                .map(|(_, term)| term)
+                .chain([&clause.body])
+            {
+                calls(term, &mut |called| {
+                    if called.ends_with('!') {
+                        found.get_or_insert_with(|| called.to_owned());
+                    }
+                });
+            }
+            if let Some(called) = found {
+                return Err(format!("`{name}` is pure and calls `{called}`"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A pattern naming a declared constructor is that constructor, not a name
 /// the clause binds.
 fn resolve(clause: &Clause, ctors: &HashMap<String, CtorId>) -> Clause {
@@ -367,10 +462,14 @@ fn matched_argument(clauses: &[Clause]) -> Result<Option<usize>, String> {
     Ok(matched)
 }
 
-/// Every constructor in the program, by name.
+/// The type a program's authority has. Its constructor is left out of the
+/// names a term may use, so no program can make one for itself.
+const HOST: &str = "Host";
+
+/// Every constructor a term may name.
 fn catalogue(program: &Program) -> HashMap<String, CtorId> {
     let mut ctors = HashMap::new();
-    for at in 0..program.types().len() {
+    for at in 1..program.types().len() {
         let id = TypeId::at(at);
         for tag in 0..u32::try_from(program.type_(id).ctors.len()).expect("a sane count") {
             let ctor = program.ctor_at(id, tag);
@@ -378,6 +477,13 @@ fn catalogue(program: &Program) -> HashMap<String, CtorId> {
         }
     }
     ctors
+}
+
+fn look_owned<T: Copy>(table: &HashMap<String, T>, name: &str, what: &str) -> Result<T, String> {
+    table
+        .get(name)
+        .copied()
+        .ok_or_else(|| format!("no {what} named `{name}`"))
 }
 
 fn look<T: Copy>(table: &HashMap<&str, T>, name: &str, what: &str) -> Result<T, String> {
@@ -619,20 +725,14 @@ fn infer(
     program: &Program,
     ctors: &HashMap<String, CtorId>,
     arity: &HashMap<&str, usize>,
+    stated: &HashMap<&str, Inferred>,
 ) -> Result<HashMap<String, Inferred>, String> {
     let mut unify = Unify {
         parent: Vec::new(),
         known: Vec::new(),
     };
     // Each function takes a run of slots: one per argument, then its result.
-    let mut base: HashMap<&str, usize> = HashMap::new();
-    for name in &source.order {
-        let at = unify.parent.len();
-        for _ in 0..=arity[name.as_str()] {
-            unify.fresh();
-        }
-        base.insert(name, at);
-    }
+    let base = slots(source, arity, stated, &mut unify)?;
 
     for name in &source.order {
         for clause in &clauses[name.as_str()] {
@@ -659,6 +759,33 @@ fn infer(
             Ok((name.clone(), (params, result)))
         })
         .collect()
+}
+
+/// A run of slots per function: one per argument, then its result. A
+/// platform states what it takes, so its slots start out settled.
+fn slots<'a>(
+    source: &'a Source,
+    arity: &HashMap<&str, usize>,
+    stated: &HashMap<&'a str, Inferred>,
+    unify: &mut Unify,
+) -> Result<HashMap<&'a str, usize>, String> {
+    let mut base = HashMap::new();
+    for name in &source.order {
+        let at = unify.parent.len();
+        for _ in 0..=arity[name.as_str()] {
+            unify.fresh();
+        }
+        base.insert(name.as_str(), at);
+    }
+    for (name, (takes, answers)) in stated {
+        let at = unify.parent.len();
+        for held in takes.iter().chain(std::iter::once(answers)) {
+            let slot = unify.fresh();
+            unify.pin(slot, *held)?;
+        }
+        base.insert(name, at);
+    }
+    Ok(base)
 }
 
 /// What a clause's patterns bind: an argument's own slot where the pattern

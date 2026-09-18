@@ -189,7 +189,7 @@ fn the_builder_writes_the_lets_itself() {
     // of its body.
     assert_eq!(program.locals(add), 4);
 
-    let body = program.function(add).body;
+    let body = program.function(add).body.expect("a defined function");
     assert!(
         program.bindings(body.bindings).is_empty(),
         "the match is the tail, with nothing bound before it"
@@ -285,7 +285,8 @@ fn a_program_reads_from_text() {
     .expect("a program");
     assert_eq!(
         program.render(),
-        "Nat = Zero | Succ(Nat)
+        "Host = Host
+Nat = Zero | Succ(Nat)
 
 add(v0: Nat, v1: Nat) -> Nat =
   match v1 {
@@ -346,7 +347,8 @@ fn a_body_works_things_out_on_the_way() {
     .expect("a program");
     assert_eq!(
         program.render(),
-        "Nat = Zero | Succ(Nat)
+        "Host = Host
+Nat = Zero | Succ(Nat)
 
 double(v0: Nat) -> Nat =
   add(v0, v0)

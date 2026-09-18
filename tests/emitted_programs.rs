@@ -589,3 +589,41 @@ fn every_target_runs_every_example() {
         }
     }
 }
+
+/// The one effect there is: a program that leaves with a status it worked
+/// out, through a platform routine it declared and a host it was handed.
+#[test]
+fn every_target_exits_with_what_it_was_told() {
+    let machine = faun::read(
+        "type Nat = Zero | Succ(Nat)
+         type Unit = Unit
+
+         platform exit! Host Nat : Unit
+
+         main!(h) -> exit!(h Succ(Succ(Succ(Zero))))",
+    )
+    .expect("a program");
+    for target in Target::ALL {
+        assert_eq!(status(target, &machine), 3, "{target}");
+    }
+}
+
+/// A pure name may not do observable work.
+#[test]
+fn a_pure_name_cannot_call_an_effect() {
+    let refused = faun::read(
+        "type Nat = Zero | Succ(Nat)
+         type Unit = Unit
+
+         platform exit! Host Nat : Unit
+
+         quietly(h) -> exit!(h Zero)
+
+         main!(h) -> quietly(h)",
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("`quietly` is pure and calls `exit!`"),
+        "{refused}"
+    );
+}
